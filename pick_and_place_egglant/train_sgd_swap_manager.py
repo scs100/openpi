@@ -41,7 +41,7 @@ DEFAULT_PROMPT = "pick and place purple long eggplant"
 # 训练配置
 BATCH_SIZE = 7              # 批量大小
 NUM_TRAIN_STEPS = 20000     # 训练步数 (增加到20k，持续训练)
-SAVE_INTERVAL = 2000        # 保存间隔 (每2k步保存)
+SAVE_INTERVAL = 500         # 保存间隔 (每500步保存，防止崩溃丢失进度)
 LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
 NUM_WORKERS = 0             # 工作进程数
 
@@ -62,12 +62,28 @@ ACTION_EXPERT_VARIANT = "gemma_300m_lora"
 # 内存管理配置
 GPU_MEM_FRACTION = '0.70'   # GPU内存分配比例
 SWAP_THRESHOLD = 70         # Swap监控阈值(%)
-MONITOR_INTERVAL = 10        # 监控间隔(秒)
+MONITOR_INTERVAL = 30       # 监控间隔(秒) - 降低频率减少系统负担
 
 # 实验配置
 EXPERIMENT_NAME = "sgd_swap_manager_20k_production"
 WANDB_PROJECT = "openpi_eggplant_production"
 CHECKPOINT_PATH = "s3://openpi-assets/checkpoints/pi0_base/params"
+
+# 恢复训练配置
+RESUME_TRAINING = True          # 是否恢复训练
+OVERWRITE_CHECKPOINT = False    # 不覆盖现有检查点
+
+# 恢复训练专用内存配置
+RESUME_GPU_MEM_FRACTION = '0.70'  # 恢复训练时使用70% (与原训练相同)
+RESUME_BATCH_SIZE = 6             # 恢复训练时使用已验证的批量大小6
+DYNAMIC_BATCH_ADJUSTMENT = False  # 已找到最优批量大小，禁用动态调整
+MIN_BATCH_SIZE = 1                # 最小批量大小
+
+# 稳定性保护配置
+MEMORY_MONITOR_INTERVAL = 60      # 内存监控间隔(秒) - 降低频率减少系统负担
+MAX_GPU_MEMORY_PERCENT = 75       # GPU内存使用率警告阈值
+MAX_SYSTEM_MEMORY_PERCENT = 60    # 系统内存使用率警告阈值 (提高到60%)
+AUTO_SAVE_INTERVAL = 500          # 自动保存间隔(步数) - 与SAVE_INTERVAL一致
 
 # 主动Swap管理配置
 class SwapManager:
@@ -84,8 +100,96 @@ class SwapManager:
 
     def initial_swap_cleanup(self):
         """训练开始前的初始swap清理"""
-        self.logger.info("🧹 执行训练前swap内存清理...")
+        if RESUME_TRAINING:
+            self.logger.info("🔄 执行恢复训练前的深度内存清理...")
+            return self._resume_training_cleanup()
+        else:
+            self.logger.info("🧹 执行训练前swap内存清理...")
+            return self._normal_training_cleanup()
 
+    def _resume_training_cleanup(self):
+        """恢复训练专用的深度内存清理"""
+        # 记录清理前状态
+        swap_before = psutil.swap_memory()
+        memory_before = psutil.virtual_memory()
+
+        self.logger.info(f"清理前 - Swap: {swap_before.used / (1024**3):.1f}GB ({swap_before.percent:.1f}%)")
+        self.logger.info(f"清理前 - 内存: {memory_before.used / (1024**3):.1f}GB ({memory_before.percent:.1f}%)")
+
+        # 1. 强制GPU内存清理（恢复训练特有）
+        self.logger.info("  🔄 执行GPU内存深度清理...")
+        try:
+            # 重置GPU
+            subprocess.run(['nvidia-smi', '--gpu-reset'], timeout=10, capture_output=True)
+            time.sleep(3)
+            self.logger.info("  - GPU重置完成")
+        except Exception as e:
+            self.logger.warning(f"  - GPU重置失败: {e}")
+
+        # 2. 多轮Python垃圾回收
+        total_collected = 0
+        for i in range(3):
+            collected = gc.collect()
+            total_collected += collected
+            time.sleep(1)
+        self.logger.info(f"  - Python深度GC回收: {total_collected} 对象")
+
+        # 3. 强制释放系统缓存
+        try:
+            subprocess.run(['sync'], timeout=15)
+            self.logger.info("  - 文件系统同步完成")
+
+            # 清理所有缓存
+            result = subprocess.run(['sudo', 'sysctl', 'vm.drop_caches=3'],
+                                  timeout=15, capture_output=True, text=True)
+            if result.returncode == 0:
+                self.logger.info("  - 系统缓存清理完成 (drop_caches=3)")
+            else:
+                self.logger.warning(f"  - 系统缓存清理失败: {result.stderr}")
+        except subprocess.TimeoutExpired:
+            self.logger.warning("  - 系统缓存清理超时")
+        except Exception as e:
+            self.logger.warning(f"  - 系统缓存清理错误: {e}")
+
+        # 4. 强制swap重置（恢复训练时更重要）
+        try:
+            result = subprocess.run(['sudo', 'swapoff', '-a'], timeout=45, capture_output=True, text=True)
+            if result.returncode == 0:
+                self.logger.info("  - Swap已关闭")
+                time.sleep(5)  # 恢复训练时等待更长时间
+
+                result = subprocess.run(['sudo', 'swapon', '-a'], timeout=45, capture_output=True, text=True)
+                if result.returncode == 0:
+                    self.logger.info("  - Swap已重新启用")
+                else:
+                    self.logger.warning(f"  - Swap重新启用失败: {result.stderr}")
+            else:
+                self.logger.info("  - 跳过swap重置 (可能正在使用中)")
+        except subprocess.TimeoutExpired:
+            self.logger.warning("  - Swap操作超时")
+        except Exception as e:
+            self.logger.warning(f"  - Swap操作错误: {e}")
+
+        # 5. 最终深度清理
+        time.sleep(2)
+        final_collected = gc.collect()
+        self.logger.info(f"  - 最终深度GC回收: {final_collected} 对象")
+
+        # 记录清理后状态
+        swap_after = psutil.swap_memory()
+        memory_after = psutil.virtual_memory()
+
+        swap_freed = (swap_before.used - swap_after.used) / (1024**3)
+        memory_freed = (memory_before.used - memory_after.used) / (1024**3)
+
+        self.logger.info(f"清理后 - Swap: {swap_after.used / (1024**3):.1f}GB ({swap_after.percent:.1f}%)")
+        self.logger.info(f"清理后 - 内存: {memory_after.used / (1024**3):.1f}GB ({memory_after.percent:.1f}%)")
+        self.logger.info(f"✅ 恢复训练深度清理效果 - Swap释放: {swap_freed:.1f}GB, 内存释放: {memory_freed:.1f}GB")
+
+        return swap_freed, memory_freed
+
+    def _normal_training_cleanup(self):
+        """正常训练的标准内存清理"""
         # 记录清理前状态
         swap_before = psutil.swap_memory()
         memory_before = psutil.virtual_memory()
@@ -156,7 +260,8 @@ class SwapManager:
         self.monitoring = True
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
-        self.logger.info(f"🔍 开始主动Swap监控 (阈值: {self.max_swap_percent}%, 间隔: {self.check_interval}s)")
+        self.logger.info(f"🔍 开始增强内存监控 (Swap阈值: {self.max_swap_percent}%, 间隔: {self.check_interval}s)")
+        self.logger.info(f"🛡️ 稳定性保护 - GPU阈值: {MAX_GPU_MEMORY_PERCENT}%, 系统内存阈值: {MAX_SYSTEM_MEMORY_PERCENT}%")
     
     def stop_monitoring(self):
         """停止监控"""
@@ -166,27 +271,78 @@ class SwapManager:
         self.logger.info("🛑 Swap监控已停止")
     
     def _monitor_loop(self):
-        """监控循环"""
+        """增强监控循环 - 包含稳定性保护"""
         while self.monitoring:
             try:
                 swap = psutil.swap_memory()
                 memory = psutil.virtual_memory()
-                
+
                 # 检查swap使用率
                 if swap.percent > self.max_swap_percent:
                     self.logger.warning(f"🚨 Swap使用率过高: {swap.percent:.1f}% > {self.max_swap_percent}%")
                     self._emergency_cleanup()
-                
-                # 检查系统内存
-                if memory.percent > 90:
-                    self.logger.warning(f"⚠️ 系统内存使用率过高: {memory.percent:.1f}%")
+
+                # 检查系统内存 - 使用配置的阈值
+                if memory.percent > MAX_SYSTEM_MEMORY_PERCENT:
+                    self.logger.warning(f"⚠️ 系统内存使用率过高: {memory.percent:.1f}% > {MAX_SYSTEM_MEMORY_PERCENT}%")
                     self._force_memory_cleanup()
-                
+
+                # 检查GPU内存
+                try:
+                    result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total',
+                                           '--format=csv,noheader,nounits'],
+                                          capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        used, total = result.stdout.strip().split(', ')
+                        gpu_percent = float(used) / float(total) * 100
+
+                        if gpu_percent > MAX_GPU_MEMORY_PERCENT:
+                            self.logger.warning(f"🖥️ GPU内存使用率过高: {gpu_percent:.1f}% > {MAX_GPU_MEMORY_PERCENT}%")
+                            self._gpu_memory_cleanup()
+                except Exception as e:
+                    self.logger.debug(f"GPU内存检查失败: {e}")
+
+                # 定期记录内存状态（每5分钟）
+                if hasattr(self, '_last_status_log'):
+                    if time.time() - self._last_status_log > 300:  # 5分钟
+                        self._log_memory_status(swap, memory)
+                        self._last_status_log = time.time()
+                else:
+                    self._last_status_log = time.time()
+
                 time.sleep(self.check_interval)
-                
+
             except Exception as e:
-                self.logger.error(f"Swap监控错误: {e}")
+                self.logger.error(f"内存监控错误: {e}")
                 time.sleep(self.check_interval)
+
+    def _gpu_memory_cleanup(self):
+        """GPU内存清理"""
+        self.logger.info("🖥️ 执行GPU内存清理...")
+        try:
+            import jax
+            jax.clear_caches()
+            gc.collect()
+            self.logger.info("  - GPU缓存清理完成")
+        except Exception as e:
+            self.logger.warning(f"  - GPU清理失败: {e}")
+
+    def _log_memory_status(self, swap, memory):
+        """记录内存状态"""
+        self.logger.info(f"📊 内存状态报告:")
+        self.logger.info(f"  - 系统内存: {memory.used / (1024**3):.1f}GB / {memory.total / (1024**3):.1f}GB ({memory.percent:.1f}%)")
+        self.logger.info(f"  - Swap: {swap.used / (1024**3):.1f}GB / {swap.total / (1024**3):.1f}GB ({swap.percent:.1f}%)")
+
+        try:
+            result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total',
+                                   '--format=csv,noheader,nounits'],
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                used, total = result.stdout.strip().split(', ')
+                gpu_percent = float(used) / float(total) * 100
+                self.logger.info(f"  - GPU内存: {used}MB / {total}MB ({gpu_percent:.1f}%)")
+        except:
+            pass
     
     def _emergency_cleanup(self):
         """紧急内存清理"""
@@ -228,10 +384,56 @@ class SwapManager:
         except:
             pass
 
+def force_gpu_memory_reset():
+    """强制GPU内存重置 - 专门用于恢复训练前清理"""
+    if not RESUME_TRAINING:
+        return
+
+    print("🔄 执行恢复训练前的强制GPU内存重置...")
+
+    try:
+        # 1. 尝试重置GPU
+        result = subprocess.run(['nvidia-smi', '--gpu-reset'],
+                              timeout=15, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("  ✅ GPU硬件重置成功")
+            time.sleep(5)
+        else:
+            print(f"  ⚠️ GPU硬件重置失败: {result.stderr}")
+    except Exception as e:
+        print(f"  ⚠️ GPU重置异常: {e}")
+
+    # 2. 强制清理所有Python GPU引用
+    try:
+        import gc
+        # 多轮垃圾回收
+        for i in range(5):
+            collected = gc.collect()
+            print(f"  🗑️ 深度GC第{i+1}轮: {collected} 对象")
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"  ⚠️ GC清理失败: {e}")
+
+    # 3. 清理JAX相关缓存
+    try:
+        import jax
+        jax.clear_caches()
+        print("  ✅ JAX缓存清理完成")
+    except Exception as e:
+        print(f"  ⚠️ JAX清理失败: {e}")
+
+    print("✅ 强制GPU内存重置完成")
+
 def optimize_system_memory():
-    """优化系统内存设置 - 使用配置常量"""
-    # GPU内存分配配置
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = GPU_MEM_FRACTION
+    """优化系统内存设置 - 使用配置常量，针对恢复训练优化"""
+    # GPU内存分配配置 - 恢复训练时更保守的内存分配
+    if RESUME_TRAINING:
+        # 恢复训练时使用更保守的内存分配，避免碎片化
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = RESUME_GPU_MEM_FRACTION
+        print(f"🔄 恢复训练模式：GPU内存分配降低到{RESUME_GPU_MEM_FRACTION}以避免碎片化")
+    else:
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = GPU_MEM_FRACTION
+
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
@@ -240,12 +442,25 @@ def optimize_system_memory():
     os.environ['JAX_PLATFORM_NAME'] = 'gpu'
     os.environ['JAX_TRACEBACK_FILTERING'] = 'off'
 
-    # 禁用编译缓存
-    os.environ['JAX_COMPILATION_CACHE_DIR'] = ''
-    os.environ['JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES'] = '999999999'
+    # 恢复训练时强制清理编译缓存
+    if RESUME_TRAINING:
+        os.environ['JAX_COMPILATION_CACHE_DIR'] = ''
+        os.environ['JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES'] = '999999999'
+        # 强制重新编译，避免缓存导致的内存问题
+        os.environ['JAX_DISABLE_JIT'] = 'false'
+        print("🧹 恢复训练模式：强制清理JAX编译缓存")
+    else:
+        # 禁用编译缓存
+        os.environ['JAX_COMPILATION_CACHE_DIR'] = ''
+        os.environ['JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES'] = '999999999'
 
-    # XLA优化
-    os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=1'
+    # XLA优化 - 恢复训练时更保守
+    if RESUME_TRAINING:
+        # 使用有效的XLA内存优化设置
+        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=1'
+        print("🔧 恢复训练模式：使用保守的XLA设置")
+    else:
+        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=1'
 
     # 系统内存优化
     os.environ['MALLOC_TRIM_THRESHOLD_'] = '0'
@@ -261,6 +476,7 @@ def optimize_system_memory():
     print("✅ WandB设置为在线模式")
 
 # 应用内存优化
+force_gpu_memory_reset()  # 恢复训练前强制重置GPU
 optimize_system_memory()
 
 from scripts.train import main
@@ -308,7 +524,7 @@ def setup_logging():
     from log_utils import setup_test_logger
 
     # 创建日志文件和日志器
-    logger, log_file = setup_test_logger("sgd_swap_manager_100steps", "logs")
+    logger, log_file = setup_test_logger("sgd_swap_manager", "logs")
 
     return logger, log_file
 
@@ -346,13 +562,13 @@ def log_system_memory(logger, step_name=""):
 
 
 
-def create_swap_managed_config():
-    """创建主动Swap管理的SGD配置"""
+def create_dynamic_training_config(initial_batch_size):
+    """创建动态训练配置，支持OOM时自动降低批量大小"""
     import openpi.training.config as _config
     from openpi.models import pi0
     from openpi.training import optimizer as _optimizer
     from eggplant_train_config import EggplantDataConfig, CheckpointWeightLoader
-    
+
     config = _config.TrainConfig(
         name="sgd_swap_manager",
         project_name=WANDB_PROJECT,
@@ -375,8 +591,8 @@ def create_swap_managed_config():
         # 权重加载器 - 使用常量定义
         weight_loader=CheckpointWeightLoader(CHECKPOINT_PATH),
 
-        # 训练参数 - 使用常量定义
-        batch_size=BATCH_SIZE,
+        # 训练参数 - 使用动态批量大小
+        batch_size=initial_batch_size,
         num_train_steps=NUM_TRAIN_STEPS,
         save_interval=SAVE_INTERVAL,
         log_interval=LOG_INTERVAL,
@@ -410,7 +626,147 @@ def create_swap_managed_config():
 
         # 实验配置 - 使用常量定义
         exp_name=EXPERIMENT_NAME,
-        overwrite=True,
+        overwrite=OVERWRITE_CHECKPOINT,
+        resume=RESUME_TRAINING,
+        wandb_enabled=True,
+    )
+
+    return config
+
+def train_with_dynamic_batch_size(capture_logger, swap_manager):
+    """使用动态批量大小进行训练"""
+    current_batch_size = RESUME_BATCH_SIZE if RESUME_TRAINING else BATCH_SIZE
+
+    # 获取原始的数据加载器函数（避免重复包装）
+    import openpi.training.data_loader as _data_loader
+    if not hasattr(_data_loader, '_original_create_data_loader'):
+        _data_loader._original_create_data_loader = _data_loader.create_data_loader
+
+    def setup_data_loader_patch():
+        """设置数据加载器补丁"""
+        def skip_norm_create_data_loader(config, **kwargs):
+            kwargs['skip_norm_stats'] = True
+            return _data_loader._original_create_data_loader(config, **kwargs)
+
+        _data_loader.create_data_loader = skip_norm_create_data_loader
+
+    while current_batch_size >= MIN_BATCH_SIZE:
+        try:
+            capture_logger.info(f"🎯 尝试批量大小: {current_batch_size}")
+
+            # 创建配置
+            config = create_dynamic_training_config(current_batch_size)
+
+            capture_logger.info(f"🔧 训练配置:")
+            capture_logger.info(f"  - 批量大小: {current_batch_size}")
+            capture_logger.info(f"  - 训练步数: {NUM_TRAIN_STEPS}")
+            capture_logger.info(f"  - GPU内存分配: {RESUME_GPU_MEM_FRACTION if RESUME_TRAINING else GPU_MEM_FRACTION}")
+            capture_logger.info(f"  - 恢复训练: {'是' if RESUME_TRAINING else '否'}")
+
+            # 设置数据加载器补丁
+            setup_data_loader_patch()
+            capture_logger.info("✅ 已跳过归一化统计计算")
+
+            # 运行训练
+            import openpi.shared.array_typing as at
+            with at.disable_typechecking():
+                capture_logger.info("🎯 开始训练...")
+                main(config)
+
+            capture_logger.info("✅ 训练成功完成!")
+            return True, current_batch_size
+
+        except Exception as e:
+            error_msg = str(e)
+            if "RESOURCE_EXHAUSTED" in error_msg or "Out of memory" in error_msg or "RecursionError" in error_msg:
+                capture_logger.warning(f"❌ 批量大小 {current_batch_size} 失败: {type(e).__name__}")
+                current_batch_size -= 1
+
+                if current_batch_size >= MIN_BATCH_SIZE:
+                    capture_logger.info(f"🔄 降低批量大小到 {current_batch_size}，重新尝试...")
+                    # 强制内存清理和重置
+                    import gc
+                    gc.collect()
+
+                    # 重置数据加载器函数
+                    _data_loader.create_data_loader = _data_loader._original_create_data_loader
+                    time.sleep(2)
+                else:
+                    capture_logger.error(f"❌ 已达到最小批量大小 {MIN_BATCH_SIZE}，仍然失败")
+                    raise
+            else:
+                capture_logger.error(f"❌ 非内存相关错误: {e}")
+                raise
+
+    capture_logger.error(f"❌ 所有批量大小都失败，最小批量大小 {MIN_BATCH_SIZE} 仍然失败")
+    return False, MIN_BATCH_SIZE
+
+def create_swap_managed_config():
+    """创建主动Swap管理的SGD配置"""
+    import openpi.training.config as _config
+    from openpi.models import pi0
+    from openpi.training import optimizer as _optimizer
+    from eggplant_train_config import EggplantDataConfig, CheckpointWeightLoader
+    
+    config = _config.TrainConfig(
+        name="sgd_swap_manager",
+        project_name=WANDB_PROJECT,
+
+        # 模型配置 - 使用常量定义
+        model=pi0.Pi0Config(
+            action_dim=ACTION_DIM,
+            action_horizon=ACTION_HORIZON,
+            max_token_len=MAX_TOKEN_LEN,
+            paligemma_variant=PALIGEMMA_VARIANT,
+            action_expert_variant=ACTION_EXPERT_VARIANT
+        ),
+
+        # 数据配置 - 使用常量定义
+        data=EggplantDataConfig(
+            data_path=EGGPLANT_DATA_PATH,
+            default_prompt=DEFAULT_PROMPT
+        ),
+
+        # 权重加载器 - 使用常量定义
+        weight_loader=CheckpointWeightLoader(CHECKPOINT_PATH),
+
+        # 训练参数 - 使用常量定义，恢复训练时调整批量大小
+        batch_size=RESUME_BATCH_SIZE if RESUME_TRAINING else BATCH_SIZE,
+        num_train_steps=NUM_TRAIN_STEPS,
+        save_interval=SAVE_INTERVAL,
+        log_interval=LOG_INTERVAL,
+        num_workers=NUM_WORKERS,
+
+        # 学习率调度 - 使用常量定义
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=WARMUP_STEPS,
+            peak_lr=PEAK_LR,
+            decay_steps=NUM_TRAIN_STEPS,  # 衰减步数等于总训练步数
+            decay_lr=DECAY_LR,
+        ),
+
+        # SGD优化器 - 使用常量定义
+        optimizer=_optimizer.SGD(
+            momentum=SGD_MOMENTUM,
+            nesterov=SGD_NESTEROV,
+        ),
+
+        # 冻结配置 - 使用常量定义
+        freeze_filter=pi0.Pi0Config(
+            action_dim=ACTION_DIM,
+            action_horizon=ACTION_HORIZON,
+            max_token_len=MAX_TOKEN_LEN,
+            paligemma_variant=PALIGEMMA_VARIANT,
+            action_expert_variant=ACTION_EXPERT_VARIANT
+        ).get_freeze_filter(),
+
+        # 内存优化设置
+        ema_decay=None,
+
+        # 实验配置 - 使用常量定义
+        exp_name=EXPERIMENT_NAME,
+        overwrite=OVERWRITE_CHECKPOINT,
+        resume=RESUME_TRAINING,
         wandb_enabled=True,
     )
     
@@ -425,6 +781,8 @@ if __name__ == "__main__":
     print("🎯 目标: 20000步持续训练，每2000步保存权重")
     print("💡 策略: 实时监控 + 主动清理 + WandB在线记录 + Terminal输出捕获")
     print(f"📝 日志文件: {log_file}")
+    print(f"🔄 恢复训练: {'启用' if RESUME_TRAINING else '禁用'}")
+    print(f"📁 覆盖检查点: {'是' if OVERWRITE_CHECKPOINT else '否'}")
     print("=" * 60)
 
     # 使用TerminalOutputCapture捕获所有输出
@@ -444,41 +802,52 @@ if __name__ == "__main__":
             # 执行训练前的swap清理
             swap_freed, memory_freed = swap_manager.initial_swap_cleanup()
 
-            # 创建配置
-            config = create_swap_managed_config()
-
-            capture_logger.info("🔧 训练配置 (使用常量定义):")
-            capture_logger.info(f"  - 批量大小: {BATCH_SIZE}")
-            capture_logger.info(f"  - 训练步数: {NUM_TRAIN_STEPS}")
-            capture_logger.info(f"  - 保存间隔: {SAVE_INTERVAL}")
-            capture_logger.info(f"  - 学习率: {PEAK_LR:.2e} -> {DECAY_LR:.2e}")
-            capture_logger.info(f"  - GPU内存分配: {GPU_MEM_FRACTION}")
-            capture_logger.info(f"  - Swap阈值: {SWAP_THRESHOLD}%")
-
-            # 学习率图表功能已移除
-
             # 启动Swap监控
             swap_manager.start_monitoring()
             log_system_memory(capture_logger, "训练开始前")
 
-            # 跳过归一化统计
-            import openpi.training.data_loader as _data_loader
-            original_create_data_loader = _data_loader.create_data_loader
+            # 使用动态批量大小训练
+            if DYNAMIC_BATCH_ADJUSTMENT and RESUME_TRAINING:
+                capture_logger.info("� 启用动态批量大小调整...")
+                success, final_batch_size = train_with_dynamic_batch_size(capture_logger, swap_manager)
 
-            def skip_norm_create_data_loader(config, **kwargs):
-                kwargs['skip_norm_stats'] = True
-                return original_create_data_loader(config, **kwargs)
+                if success:
+                    capture_logger.info(f"✅ 动态训练成功完成! 最终批量大小: {final_batch_size}")
+                else:
+                    capture_logger.error("❌ 动态训练失败")
+                    raise RuntimeError("动态批量大小调整失败")
+            else:
+                # 传统训练方式
+                config = create_swap_managed_config()
 
-            _data_loader.create_data_loader = skip_norm_create_data_loader
-            capture_logger.info("✅ 已跳过归一化统计计算")
+                capture_logger.info("🔧 训练配置:")
+                capture_logger.info(f"  - 批量大小: {config.batch_size}")
+                capture_logger.info(f"  - 训练步数: {NUM_TRAIN_STEPS}")
+                capture_logger.info(f"  - 保存间隔: {SAVE_INTERVAL}")
+                capture_logger.info(f"  - 学习率: {PEAK_LR:.2e} -> {DECAY_LR:.2e}")
+                capture_logger.info(f"  - GPU内存分配: {RESUME_GPU_MEM_FRACTION if RESUME_TRAINING else GPU_MEM_FRACTION}")
+                capture_logger.info(f"  - Swap阈值: {SWAP_THRESHOLD}%")
 
-            # 运行训练
-            import openpi.shared.array_typing as at
-            with at.disable_typechecking():
-                capture_logger.info("🎯 开始训练...")
-                main(config)
+                # 跳过归一化统计（避免重复包装）
+                import openpi.training.data_loader as _data_loader
+                if not hasattr(_data_loader, '_original_create_data_loader'):
+                    _data_loader._original_create_data_loader = _data_loader.create_data_loader
 
-            capture_logger.info("✅ 训练成功完成!")
+                def skip_norm_create_data_loader(config, **kwargs):
+                    kwargs['skip_norm_stats'] = True
+                    return _data_loader._original_create_data_loader(config, **kwargs)
+
+                _data_loader.create_data_loader = skip_norm_create_data_loader
+                capture_logger.info("✅ 已跳过归一化统计计算")
+
+                # 运行训练
+                import openpi.shared.array_typing as at
+                with at.disable_typechecking():
+                    capture_logger.info("🎯 开始训练...")
+                    main(config)
+
+                capture_logger.info("✅ 训练成功完成!")
+
             capture_logger.info(f"🎉 紧急清理次数: {swap_manager.emergency_cleanup_count}")
 
             # 记录训练总结
