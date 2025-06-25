@@ -106,8 +106,10 @@ class EggplantDataConfig(_config.DataConfigFactory):
     default_prompt: str = "pick and place purple long eggplant"
 
     def create(self, assets_dirs, model_config):
-        """创建数据配置实例 - 自动检测数据源"""
+        """创建数据配置实例 - 自动检测数据源并加载norm stats"""
         import os
+        from openpi.shared import normalize as _normalize
+        from pathlib import Path
 
         print(f"🔍 检查数据路径: {self.data_path}")
 
@@ -116,12 +118,30 @@ class EggplantDataConfig(_config.DataConfigFactory):
             print(f"📝 使用提示: {self.default_prompt}")
             print("🎯 启用真实数据训练！")
 
+            # 加载自己数据的norm stats
+            norm_stats = None
+            norm_stats_path = Path("assets/pick_and_place_eggplant")
+
+            try:
+                if norm_stats_path.exists():
+                    norm_stats = _normalize.load(norm_stats_path)
+                    print(f"✅ 成功加载自己数据的norm stats: {norm_stats_path}")
+                    print(f"   State shape: {norm_stats['state'].mean.shape}")
+                    print(f"   Action shape: {norm_stats['actions'].mean.shape}")
+                else:
+                    print(f"⚠️ 未找到norm stats: {norm_stats_path}")
+            except Exception as e:
+                print(f"❌ 加载norm stats失败: {e}")
+                norm_stats = None
+
             # 使用真实茄子数据 - 参考LeRobotAlohaDataConfig的实现
             # 创建model transforms，包含默认prompt注入
             model_transforms = _config.ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
             return _config.DataConfig(
                 repo_id="eggplant_real_data",  # 特殊标识符，我们会在数据加载器中处理
+                asset_id="pick_and_place_eggplant",  # 指定asset_id用于norm stats
+                norm_stats=norm_stats,  # 直接设置norm stats
                 model_transforms=model_transforms,  # 使用标准的model transforms
             )
         else:

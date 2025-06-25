@@ -37,14 +37,27 @@ sys.path.insert(0, os.path.abspath('.'))
 # 数据配置
 EGGPLANT_DATA_PATH = "/home/testuser/data/pick_and_place_eggplant/openpi"
 DEFAULT_PROMPT = "pick and place purple long eggplant"
+# 实验配置
+EXPERIMENT_NAME = "sgd_swap_manager_norm"
+WANDB_PROJECT = "openpi_eggplant_production"
+# 恢复训练配置
+RESUME_TRAINING = True          # 
+OVERWRITE_CHECKPOINT = False    #  
 
+#开始 bat 4 
+# workers 1 
+# save 10
+
+#resume  bat 6 
+# workers 4 
+# save 1000
 # 训练配置
-BATCH_SIZE = 4              # 批量大小 (降低以减少内存压力)
+BATCH_SIZE = 6             # 批量大小 (降低以减少内存压力)
+NUM_WORKERS = 4            # 工作进程数 (最佳性能稳定性平衡点)
+SAVE_INTERVAL = 1000       # 保存间隔 (每1000步保存，大幅减少内存压力)
 NUM_TRAIN_STEPS = 20000     # 训练步数 (增加到20k，持续训练)
-SAVE_INTERVAL = 1000        # 保存间隔 (每1000步保存，大幅减少内存压力)
 LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
 KEEP_PERIOD = 2000          # 检查点保留周期 (每2000步的检查点永久保留)
-NUM_WORKERS = 4            # 工作进程数 (最佳性能稳定性平衡点)
 
 # 学习率配置 - 动态预热步数
 WARMUP_RATIO = 0.02         # 预热比例 (2% of total steps)
@@ -68,14 +81,10 @@ SWAP_ACTION_THRESHOLD = 50     # 行动阈值 - 中度清理
 SWAP_EMERGENCY_THRESHOLD = 70  # 紧急阈值 - 重度清理
 MONITOR_INTERVAL = 10          # 监控间隔(秒) - 平衡监控和性能
 
-# 实验配置
-EXPERIMENT_NAME = "sgd_swap_manager_20k_production"
-WANDB_PROJECT = "openpi_eggplant_production"
+
 CHECKPOINT_PATH = "s3://openpi-assets/checkpoints/pi0_base/params"
 
-# 恢复训练配置
-RESUME_TRAINING = True          # 是否恢复训练
-OVERWRITE_CHECKPOINT = False    # 不覆盖现有检查点
+
 
 # 计算动态预热步数 (在RESUME_TRAINING定义后)
 WARMUP_STEPS = int(NUM_TRAIN_STEPS * WARMUP_RATIO) if not RESUME_TRAINING else 50  # 恢复训练时短预热
@@ -703,15 +712,41 @@ patch_memory_optimized_data_loader()
 global_swap_manager = None
 
 def patch_checkpoint_save_with_memory_cleanup():
-    """补丁保存检查点函数，添加内存预清理"""
+    """补丁保存检查点函数，跳过重复的norm stats保存"""
     from openpi.training import checkpoints as _checkpoints
+    import glob
+    import shutil
 
     # 保存原始函数
     original_save_state = _checkpoints.save_state
 
     def memory_safe_save_state(checkpoint_manager, state, data_loader, step):
-        """内存安全的保存状态函数 - 增强版"""
+        """内存安全的保存状态函数 - 增强版，包含临时目录清理"""
         global global_swap_manager
+
+        # 清理可能存在的临时目录
+        try:
+            if hasattr(checkpoint_manager, '_directory'):
+                checkpoint_dir = str(checkpoint_manager._directory)
+            elif hasattr(checkpoint_manager, 'directory'):
+                checkpoint_dir = str(checkpoint_manager.directory)
+            else:
+                checkpoint_dir = None
+
+            if checkpoint_dir:
+                temp_pattern = f"{checkpoint_dir}/{step}.orbax-checkpoint-tmp-*"
+                temp_dirs = glob.glob(temp_pattern)
+                for temp_dir in temp_dirs:
+                    try:
+                        shutil.rmtree(temp_dir)
+                        if global_swap_manager:
+                            global_swap_manager.logger.info(f"🧹 清理残留临时目录: {temp_dir}")
+                    except Exception as e:
+                        if global_swap_manager:
+                            global_swap_manager.logger.warning(f"⚠️ 清理临时目录失败: {e}")
+        except Exception as e:
+            if global_swap_manager:
+                global_swap_manager.logger.warning(f"⚠️ 临时目录清理异常: {e}")
 
         if global_swap_manager is not None:
             # 检查当前内存状态
@@ -762,11 +797,30 @@ def patch_checkpoint_save_with_memory_cleanup():
                     global_swap_manager.save_skip_count = 0
                 global_swap_manager.logger.info(f"✅ 内存充足 {available_memory:.1f}GB，开始保存权重")
 
-        # 执行原始保存操作
+        # 执行修改后的保存操作 - 跳过重复的norm stats保存
         try:
-            original_save_state(checkpoint_manager, state, data_loader, step)
+            # 创建一个不保存norm stats的save_assets函数
+            def skip_norm_save_assets(directory):
+                # 跳过norm stats保存，因为我们已经有了
+                if global_swap_manager is not None:
+                    global_swap_manager.logger.info(f"⏭️ 跳过重复的norm stats保存")
+                pass
+
+            # 分离参数用于推理
+            from openpi.shared import array_typing as at
+            with at.disable_typechecking():
+                train_state_for_save, params = _checkpoints._split_params(state)
+
+            # 只保存必要的项目，跳过assets
+            items = {
+                "train_state": train_state_for_save,
+                "params": {"params": params},
+            }
+
+            checkpoint_manager.save(step, items)
+
             if global_swap_manager is not None:
-                global_swap_manager.logger.info(f"✅ 步骤 {step} 权重保存成功")
+                global_swap_manager.logger.info(f"✅ 步骤 {step} 权重保存成功 (跳过norm stats)")
         except Exception as e:
             if global_swap_manager is not None:
                 global_swap_manager.logger.error(f"❌ 步骤 {step} 权重保存失败: {e}")
@@ -905,12 +959,13 @@ def train_with_dynamic_batch_size(capture_logger, swap_manager):
         _data_loader._original_create_data_loader = _data_loader.create_data_loader
 
     def setup_data_loader_patch():
-        """设置数据加载器补丁"""
-        def skip_norm_create_data_loader(config, **kwargs):
-            kwargs['skip_norm_stats'] = True
+        """设置数据加载器补丁 - 使用norm stats"""
+        def use_norm_create_data_loader(config, **kwargs):
+            # 启用norm stats，测试单进程是否避免竞争
+            kwargs['skip_norm_stats'] = False
             return _data_loader._original_create_data_loader(config, **kwargs)
 
-        _data_loader.create_data_loader = skip_norm_create_data_loader
+        _data_loader.create_data_loader = use_norm_create_data_loader
 
     while current_batch_size >= MIN_BATCH_SIZE:
         try:
@@ -927,7 +982,7 @@ def train_with_dynamic_batch_size(capture_logger, swap_manager):
 
             # 设置数据加载器补丁
             setup_data_loader_patch()
-            capture_logger.info("✅ 已跳过归一化统计计算")
+            capture_logger.info("✅ 已启用norm stats (单进程测试)")
 
             # 运行训练
             import openpi.shared.array_typing as at
@@ -1096,17 +1151,18 @@ if __name__ == "__main__":
                 capture_logger.info(f"  - GPU内存分配: {RESUME_GPU_MEM_FRACTION if RESUME_TRAINING else GPU_MEM_FRACTION}")
                 capture_logger.info(f"  - Swap阈值: 警告{SWAP_WARNING_THRESHOLD}% / 行动{SWAP_ACTION_THRESHOLD}% / 紧急{SWAP_EMERGENCY_THRESHOLD}%")
 
-                # 跳过归一化统计（避免重复包装）
+                # 使用归一化统计（避免重复包装）
                 import openpi.training.data_loader as _data_loader
                 if not hasattr(_data_loader, '_original_create_data_loader'):
                     _data_loader._original_create_data_loader = _data_loader.create_data_loader
 
-                def skip_norm_create_data_loader(config, **kwargs):
-                    kwargs['skip_norm_stats'] = True
+                def use_norm_create_data_loader(config, **kwargs):
+                    # 启用norm stats，测试单进程是否避免竞争
+                    kwargs['skip_norm_stats'] = False
                     return _data_loader._original_create_data_loader(config, **kwargs)
 
-                _data_loader.create_data_loader = skip_norm_create_data_loader
-                capture_logger.info("✅ 已跳过归一化统计计算")
+                _data_loader.create_data_loader = use_norm_create_data_loader
+                capture_logger.info("✅ 已启用norm stats (单进程测试)")
 
                 # 运行训练
                 import openpi.shared.array_typing as at
