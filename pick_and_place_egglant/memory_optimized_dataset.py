@@ -12,7 +12,7 @@ from typing import Dict, Any
 import numpy as np
 import pandas as pd
 from PIL import Image
-import weakref
+
 
 class MemoryOptimizedEggplantDataset:
     """内存优化的茄子数据集加载器 - 流式加载，减少内存占用"""
@@ -24,10 +24,11 @@ class MemoryOptimizedEggplantDataset:
         # 不预加载所有数据，只记录文件路径和索引
         self._build_file_index()
         
-        # 图像缓存 - 使用弱引用避免内存泄漏
-        self._image_cache = weakref.WeakValueDictionary()
+        # 图像缓存 - 使用普通字典，支持多进程
+        self._image_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
+        self._max_cache_size = 1000  # 限制缓存大小避免内存泄漏
     
     def _build_file_index(self):
         """构建文件索引，不加载实际数据"""
@@ -122,9 +123,14 @@ class MemoryOptimizedEggplantDataset:
                 elif img_array.shape[-1] == 4:  # RGBA
                     img_array = img_array[:, :, :3]
             
-            # 缓存处理后的图像
+            # 缓存处理后的图像，管理缓存大小
+            if len(self._image_cache) >= self._max_cache_size:
+                # 简单的FIFO策略：删除最早的缓存项
+                oldest_key = next(iter(self._image_cache))
+                del self._image_cache[oldest_key]
+
             self._image_cache[cache_key] = img_array
-            
+
             return img_array
             
         except Exception as e:

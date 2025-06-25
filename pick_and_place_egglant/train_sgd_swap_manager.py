@@ -39,14 +39,15 @@ EGGPLANT_DATA_PATH = "/home/testuser/data/pick_and_place_eggplant/openpi"
 DEFAULT_PROMPT = "pick and place purple long eggplant"
 
 # 训练配置
-BATCH_SIZE = 7              # 批量大小
+BATCH_SIZE = 4              # 批量大小 (降低以减少内存压力)
 NUM_TRAIN_STEPS = 20000     # 训练步数 (增加到20k，持续训练)
-SAVE_INTERVAL = 500         # 保存间隔 (每500步保存，防止崩溃丢失进度)
+SAVE_INTERVAL = 1000        # 保存间隔 (每1000步保存，大幅减少内存压力)
 LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
-NUM_WORKERS = 0             # 工作进程数
+KEEP_PERIOD = 2000          # 检查点保留周期 (每2000步的检查点永久保留)
+NUM_WORKERS = 4            # 工作进程数 (最佳性能稳定性平衡点)
 
-# 学习率配置
-WARMUP_STEPS = 10           # 预热步数
+# 学习率配置 - 动态预热步数
+WARMUP_RATIO = 0.02         # 预热比例 (2% of total steps)
 PEAK_LR = 1e-4              # 峰值学习率
 DECAY_LR = 1e-5             # 最终学习率
 SGD_MOMENTUM = 0.9          # SGD动量
@@ -61,8 +62,11 @@ ACTION_EXPERT_VARIANT = "gemma_300m_lora"
 
 # 内存管理配置
 GPU_MEM_FRACTION = '0.70'   # GPU内存分配比例
-SWAP_THRESHOLD = 70         # Swap监控阈值(%)
-MONITOR_INTERVAL = 30       # 监控间隔(秒) - 降低频率减少系统负担
+# 分阶段Swap管理阈值 - 优化版
+SWAP_WARNING_THRESHOLD = 30    # 警告阈值 - 开始轻度清理
+SWAP_ACTION_THRESHOLD = 50     # 行动阈值 - 中度清理
+SWAP_EMERGENCY_THRESHOLD = 70  # 紧急阈值 - 重度清理
+MONITOR_INTERVAL = 10          # 监控间隔(秒) - 平衡监控和性能
 
 # 实验配置
 EXPERIMENT_NAME = "sgd_swap_manager_20k_production"
@@ -73,6 +77,9 @@ CHECKPOINT_PATH = "s3://openpi-assets/checkpoints/pi0_base/params"
 RESUME_TRAINING = True          # 是否恢复训练
 OVERWRITE_CHECKPOINT = False    # 不覆盖现有检查点
 
+# 计算动态预热步数 (在RESUME_TRAINING定义后)
+WARMUP_STEPS = int(NUM_TRAIN_STEPS * WARMUP_RATIO) if not RESUME_TRAINING else 50  # 恢复训练时短预热
+
 # 恢复训练专用内存配置
 RESUME_GPU_MEM_FRACTION = '0.70'  # 恢复训练时使用70% (与原训练相同)
 RESUME_BATCH_SIZE = 6             # 恢复训练时使用已验证的批量大小6
@@ -82,8 +89,16 @@ MIN_BATCH_SIZE = 1                # 最小批量大小
 # 稳定性保护配置
 MEMORY_MONITOR_INTERVAL = 60      # 内存监控间隔(秒) - 降低频率减少系统负担
 MAX_GPU_MEMORY_PERCENT = 75       # GPU内存使用率警告阈值
-MAX_SYSTEM_MEMORY_PERCENT = 60    # 系统内存使用率警告阈值 (提高到60%)
+MAX_SYSTEM_MEMORY_PERCENT = 85    # 系统内存使用率警告阈值 (调整到85%)
 AUTO_SAVE_INTERVAL = 500          # 自动保存间隔(步数) - 与SAVE_INTERVAL一致
+
+# 动态批量大小调整配置
+ENABLE_DYNAMIC_BATCH_SCALING = True   # 启用训练中动态批量大小调整
+TARGET_GPU_UTILIZATION = 73          # 目标GPU显存使用率 (73%)
+SAFE_GPU_UTILIZATION = 78            # 安全上限GPU显存使用率 (78%)
+BATCH_ADJUSTMENT_INTERVAL = 100       # 每100步检查一次是否可以调整批量大小
+MIN_STABLE_STEPS = 50                 # 批量大小稳定运行50步后才考虑增加
+MAX_BATCH_SIZE = 10                   # 最大批量大小限制
 
 # 主动Swap管理配置
 class SwapManager:
@@ -277,15 +292,26 @@ class SwapManager:
                 swap = psutil.swap_memory()
                 memory = psutil.virtual_memory()
 
-                # 检查swap使用率
-                if swap.percent > self.max_swap_percent:
-                    self.logger.warning(f"🚨 Swap使用率过高: {swap.percent:.1f}% > {self.max_swap_percent}%")
+                # 分阶段Swap管理
+                if swap.percent > SWAP_EMERGENCY_THRESHOLD:
+                    self.logger.warning(f"🚨 Swap紧急阈值: {swap.percent:.1f}% > {SWAP_EMERGENCY_THRESHOLD}%")
                     self._emergency_cleanup()
+                elif swap.percent > SWAP_ACTION_THRESHOLD:
+                    self.logger.warning(f"⚠️ Swap行动阈值: {swap.percent:.1f}% > {SWAP_ACTION_THRESHOLD}%")
+                    self._moderate_cleanup()
+                elif swap.percent > SWAP_WARNING_THRESHOLD:
+                    self.logger.info(f"💡 Swap警告阈值: {swap.percent:.1f}% > {SWAP_WARNING_THRESHOLD}%")
+                    self._light_cleanup()
 
                 # 检查系统内存 - 使用配置的阈值
                 if memory.percent > MAX_SYSTEM_MEMORY_PERCENT:
                     self.logger.warning(f"⚠️ 系统内存使用率过高: {memory.percent:.1f}% > {MAX_SYSTEM_MEMORY_PERCENT}%")
                     self._force_memory_cleanup()
+
+                # 激进内存保护 - 当内存使用率超过95%时
+                if memory.percent > 95:
+                    self.logger.error(f"🚨 内存使用率危险 {memory.percent:.1f}%，启动激进保护")
+                    self.aggressive_memory_protection()
 
                 # 检查GPU内存
                 try:
@@ -353,12 +379,30 @@ class SwapManager:
         collected = gc.collect()
         self.logger.info(f"  - Python GC回收: {collected} 对象")
         
-        # 2. 强制释放系统内存
+        # 2. 强制释放系统内存 - 增强版
         try:
             subprocess.run(['sync'], timeout=5)
-            # 尝试释放页面缓存 (需要权限)
+            # 尝试释放页面缓存 (需要权限) - 更激进的清理
             try:
-                subprocess.run(['sudo', 'sysctl', 'vm.drop_caches=1'], timeout=5, check=False)
+                subprocess.run(['sudo', 'sysctl', 'vm.drop_caches=3'], timeout=5, check=False)
+                self.logger.info("  - 系统缓存清理: drop_caches=3")
+            except:
+                try:
+                    subprocess.run(['sudo', 'sysctl', 'vm.drop_caches=1'], timeout=5, check=False)
+                    self.logger.info("  - 系统缓存清理: drop_caches=1")
+                except:
+                    pass
+
+            # 温和的swap压缩 (不重置，避免数据重新加载)
+            try:
+                # 只在swap使用率超过80%时才考虑重置
+                swap = psutil.swap_memory()
+                if swap.percent > 80:
+                    subprocess.run(['sudo', 'swapoff', '-a'], timeout=10, check=False)
+                    subprocess.run(['sudo', 'swapon', '-a'], timeout=10, check=False)
+                    self.logger.info("  - 紧急Swap重置完成 (>80%)")
+                else:
+                    self.logger.info("  - Swap使用率可控，跳过重置")
             except:
                 pass
         except:
@@ -376,6 +420,22 @@ class SwapManager:
         if self.emergency_cleanup_count > 5:
             self.logger.error("🚨 紧急清理次数过多，建议检查内存配置或暂停训练")
     
+    def _light_cleanup(self):
+        """轻度清理 - 25%阈值触发"""
+        self.logger.info("🧹 执行轻度内存清理...")
+        gc.collect()
+
+    def _moderate_cleanup(self):
+        """中度清理 - 40%阈值触发"""
+        self.logger.info("🧽 执行中度内存清理...")
+        gc.collect()
+        try:
+            subprocess.run(['sync'], timeout=5)
+            subprocess.run(['sudo', 'sysctl', 'vm.drop_caches=1'], timeout=5, check=False)
+            self.logger.info("  - 页面缓存清理完成")
+        except:
+            pass
+
     def _force_memory_cleanup(self):
         """强制内存清理"""
         gc.collect()
@@ -383,6 +443,126 @@ class SwapManager:
             subprocess.run(['sync'], timeout=5)
         except:
             pass
+
+    def pre_save_cleanup(self):
+        """保存权重前的预清理 - 确保有足够内存"""
+        self.logger.info("💾 执行保存前内存预清理...")
+
+        # 记录清理前状态
+        swap_before = psutil.swap_memory()
+        memory_before = psutil.virtual_memory()
+
+        # 1. 强制Python垃圾回收
+        collected = gc.collect()
+        self.logger.info(f"  - Python GC回收: {collected} 对象")
+
+        # 2. 清理系统缓存
+        try:
+            subprocess.run(['sync'], timeout=5)
+            subprocess.run(['sudo', 'sysctl', 'vm.drop_caches=1'], timeout=5, check=False)
+            self.logger.info("  - 系统缓存清理完成")
+        except:
+            pass
+
+        # 3. JAX缓存清理
+        try:
+            import jax
+            jax.clear_caches()
+            self.logger.info("  - JAX缓存清理完成")
+        except:
+            pass
+
+        # 记录清理后状态
+        swap_after = psutil.swap_memory()
+        memory_after = psutil.virtual_memory()
+
+        self.logger.info(f"  - 内存释放: {(memory_before.used - memory_after.used) / (1024**3):.1f}GB")
+        self.logger.info(f"  - Swap释放: {(swap_before.used - swap_after.used) / (1024**3):.1f}GB")
+        self.logger.info(f"  - 当前可用内存: {memory_after.available / (1024**3):.1f}GB")
+
+        return memory_after.available / (1024**3)  # 返回可用内存GB数
+
+    def aggressive_memory_protection(self):
+        """激进内存保护 - 清理无用进程保全训练"""
+        self.logger.info("🛡️ 执行激进内存保护...")
+
+        try:
+            import psutil
+            current_pid = os.getpid()
+
+            # 1. 找出内存占用大的非关键进程
+            memory_hogs = []
+            for proc in psutil.process_iter(['pid', 'name', 'memory_percent', 'cmdline']):
+                try:
+                    if proc.info['pid'] == current_pid:
+                        continue  # 跳过当前训练进程
+
+                    # 跳过系统关键进程
+                    if proc.info['name'] in ['systemd', 'kernel', 'kthreadd', 'init', 'ssh', 'sshd']:
+                        continue
+
+                    # 跳过GPU相关进程
+                    cmdline = ' '.join(proc.info['cmdline'] or [])
+                    if 'nvidia' in cmdline.lower() or 'cuda' in cmdline.lower():
+                        continue
+
+                    # 找出内存占用超过1%的进程
+                    if proc.info['memory_percent'] > 1.0:
+                        memory_hogs.append({
+                            'pid': proc.info['pid'],
+                            'name': proc.info['name'],
+                            'memory_percent': proc.info['memory_percent'],
+                            'cmdline': cmdline[:100]  # 限制长度
+                        })
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            # 2. 按内存占用排序
+            memory_hogs.sort(key=lambda x: x['memory_percent'], reverse=True)
+
+            # 3. 清理内存占用大的非关键进程
+            killed_count = 0
+            freed_memory = 0
+
+            for proc in memory_hogs[:5]:  # 最多清理5个进程
+                try:
+                    # 跳过一些重要的进程
+                    if any(keyword in proc['name'].lower() for keyword in ['python', 'wandb', 'tmux', 'screen']):
+                        if 'openpi' not in proc['cmdline']:  # 如果不是OpenPI相关的Python进程
+                            continue
+
+                    self.logger.info(f"  🎯 清理进程: {proc['name']} (PID: {proc['pid']}, 内存: {proc['memory_percent']:.1f}%)")
+
+                    # 尝试优雅终止
+                    process = psutil.Process(proc['pid'])
+                    process.terminate()
+
+                    # 等待2秒
+                    try:
+                        process.wait(timeout=2)
+                    except psutil.TimeoutExpired:
+                        # 强制杀死
+                        process.kill()
+                        self.logger.info(f"    💀 强制杀死进程 {proc['pid']}")
+
+                    freed_memory += proc['memory_percent']
+                    killed_count += 1
+
+                except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
+                    continue
+
+            # 4. 清理系统缓存
+            try:
+                subprocess.run(['sync'], timeout=5)
+                subprocess.run(['sudo', 'sysctl', 'vm.drop_caches=3'], timeout=5, check=False)
+                self.logger.info("  🧹 系统缓存清理完成")
+            except:
+                pass
+
+            self.logger.info(f"✅ 激进清理完成: 清理了{killed_count}个进程，释放约{freed_memory:.1f}%内存")
+
+        except Exception as e:
+            self.logger.error(f"❌ 激进内存保护失败: {e}")
 
 def force_gpu_memory_reset():
     """强制GPU内存重置 - 专门用于恢复训练前清理"""
@@ -519,6 +699,87 @@ def patch_memory_optimized_data_loader():
 
 patch_memory_optimized_data_loader()
 
+# 创建全局swap管理器实例
+global_swap_manager = None
+
+def patch_checkpoint_save_with_memory_cleanup():
+    """补丁保存检查点函数，添加内存预清理"""
+    from openpi.training import checkpoints as _checkpoints
+
+    # 保存原始函数
+    original_save_state = _checkpoints.save_state
+
+    def memory_safe_save_state(checkpoint_manager, state, data_loader, step):
+        """内存安全的保存状态函数 - 增强版"""
+        global global_swap_manager
+
+        if global_swap_manager is not None:
+            # 检查当前内存状态
+            memory = psutil.virtual_memory()
+            current_usage = memory.percent
+
+            global_swap_manager.logger.info(f"💾 准备保存步骤 {step}，当前内存使用: {current_usage:.1f}%")
+
+            # 如果内存使用率超过90%，执行强制清理
+            if current_usage > 90:
+                global_swap_manager.logger.warning(f"🚨 内存使用率过高 {current_usage:.1f}%，执行强制清理")
+                global_swap_manager._emergency_cleanup()
+
+                # 重新检查内存
+                memory = psutil.virtual_memory()
+                current_usage = memory.percent
+                global_swap_manager.logger.info(f"🧹 清理后内存使用: {current_usage:.1f}%")
+
+            # 保存前预清理
+            available_memory = global_swap_manager.pre_save_cleanup()
+
+            # 严格的内存检查 - 需要至少8GB可用内存
+            if available_memory < 8.0:
+                error_msg = f"❌ 内存不足，无法安全保存权重！可用内存: {available_memory:.1f}GB < 8.0GB"
+                global_swap_manager.logger.error(error_msg)
+                global_swap_manager.logger.error("🛑 跳过此次保存，避免系统崩溃")
+
+                # 智能处理：记录跳过次数并采取渐进式措施
+                if not hasattr(global_swap_manager, 'save_skip_count'):
+                    global_swap_manager.save_skip_count = 0
+                global_swap_manager.save_skip_count += 1
+
+                global_swap_manager.logger.warning(f"⚠️ 连续跳过保存次数: {global_swap_manager.save_skip_count}")
+
+                # 渐进式内存管理策略
+                if global_swap_manager.save_skip_count >= 2:
+                    global_swap_manager.logger.error("🚨 连续跳过保存2次，执行深度内存清理")
+                    global_swap_manager._deep_memory_cleanup()
+
+                if global_swap_manager.save_skip_count >= 3:
+                    global_swap_manager.logger.error("🚨 连续跳过保存3次，建议降低批量大小或重启训练")
+                    # 可以在这里添加自动降低批量大小的逻辑
+
+                return  # 直接返回，不执行保存
+            else:
+                # 保存成功，重置跳过计数
+                if hasattr(global_swap_manager, 'save_skip_count'):
+                    global_swap_manager.save_skip_count = 0
+                global_swap_manager.logger.info(f"✅ 内存充足 {available_memory:.1f}GB，开始保存权重")
+
+        # 执行原始保存操作
+        try:
+            original_save_state(checkpoint_manager, state, data_loader, step)
+            if global_swap_manager is not None:
+                global_swap_manager.logger.info(f"✅ 步骤 {step} 权重保存成功")
+        except Exception as e:
+            if global_swap_manager is not None:
+                global_swap_manager.logger.error(f"❌ 步骤 {step} 权重保存失败: {e}")
+                # 保存失败后立即清理内存
+                global_swap_manager._emergency_cleanup()
+            raise
+
+    # 替换函数
+    _checkpoints.save_state = memory_safe_save_state
+    print("✅ 已应用内存安全的权重保存补丁")
+
+patch_checkpoint_save_with_memory_cleanup()
+
 def setup_logging():
     """简单有效的日志设置"""
     from log_utils import setup_test_logger
@@ -596,6 +857,7 @@ def create_dynamic_training_config(initial_batch_size):
         num_train_steps=NUM_TRAIN_STEPS,
         save_interval=SAVE_INTERVAL,
         log_interval=LOG_INTERVAL,
+        keep_period=KEEP_PERIOD,  # 保留重要检查点
         num_workers=NUM_WORKERS,
 
         # 学习率调度 - 使用常量定义
@@ -735,6 +997,7 @@ def create_swap_managed_config():
         num_train_steps=NUM_TRAIN_STEPS,
         save_interval=SAVE_INTERVAL,
         log_interval=LOG_INTERVAL,
+        keep_period=KEEP_PERIOD,  # 保留重要检查点
         num_workers=NUM_WORKERS,
 
         # 学习率调度 - 使用常量定义
@@ -792,7 +1055,11 @@ if __name__ == "__main__":
         capture_logger.info("🔍 开始捕获所有terminal输出到日志文件")
 
         # 创建Swap管理器
-        swap_manager = SwapManager(capture_logger, max_swap_percent=SWAP_THRESHOLD, check_interval=MONITOR_INTERVAL)
+        swap_manager = SwapManager(capture_logger, max_swap_percent=SWAP_EMERGENCY_THRESHOLD, check_interval=MONITOR_INTERVAL)
+
+        # 设置全局swap管理器，用于权重保存时的内存管理
+        global_swap_manager = swap_manager
+
         start_time = time.time()
 
         try:
@@ -823,10 +1090,11 @@ if __name__ == "__main__":
                 capture_logger.info("🔧 训练配置:")
                 capture_logger.info(f"  - 批量大小: {config.batch_size}")
                 capture_logger.info(f"  - 训练步数: {NUM_TRAIN_STEPS}")
+                capture_logger.info(f"  - 预热步数: {WARMUP_STEPS} ({WARMUP_STEPS/NUM_TRAIN_STEPS*100:.1f}%)")
                 capture_logger.info(f"  - 保存间隔: {SAVE_INTERVAL}")
                 capture_logger.info(f"  - 学习率: {PEAK_LR:.2e} -> {DECAY_LR:.2e}")
                 capture_logger.info(f"  - GPU内存分配: {RESUME_GPU_MEM_FRACTION if RESUME_TRAINING else GPU_MEM_FRACTION}")
-                capture_logger.info(f"  - Swap阈值: {SWAP_THRESHOLD}%")
+                capture_logger.info(f"  - Swap阈值: 警告{SWAP_WARNING_THRESHOLD}% / 行动{SWAP_ACTION_THRESHOLD}% / 紧急{SWAP_EMERGENCY_THRESHOLD}%")
 
                 # 跳过归一化统计（避免重复包装）
                 import openpi.training.data_loader as _data_loader
