@@ -101,19 +101,145 @@ class EggplantDataset:
 
 @dataclasses.dataclass(frozen=True)
 class EggplantDataConfig(_config.DataConfigFactory):
-    """茄子数据配置工厂 - 智能适配真实数据或假数据"""
+    """茄子数据配置工厂 - 智能适配真实数据或假数据，自动计算norm stats"""
     data_path: str = "/home/testuser/data/pick_and_place_eggplant/openpi"
     default_prompt: str = "pick and place purple long eggplant"
+    use_custom_norm_stats: bool = True  # 使用自定义norm stats
+    auto_compute_norm_stats: bool = True  # 自动计算norm stats
+
+    def _compute_norm_stats_if_needed(self, output_dir="assets/pick_and_place_eggplant"):
+        """如果不存在norm stats，则自动计算"""
+        from openpi.shared import normalize as _normalize
+        import pandas as pd
+        import numpy as np
+        from pathlib import Path
+        import tqdm
+
+        output_path = Path(output_dir)
+        norm_stats_file = output_path / "norm_stats.json"
+
+        # 检查是否已存在norm stats
+        if norm_stats_file.exists():
+            try:
+                norm_stats = _normalize.load(output_path)
+                print(f"✅ 找到现有norm stats: {norm_stats_file}")
+                return norm_stats
+            except Exception as e:
+                print(f"⚠️ 现有norm stats损坏: {e}")
+                print("🔄 重新计算norm stats...")
+        else:
+            print(f"❌ 未找到norm stats: {norm_stats_file}")
+            print("🔄 开始自动计算norm stats...")
+
+        # 自动计算norm stats
+        try:
+            data_path = Path(self.data_path)
+            parquet_files = list(data_path.glob("data/chunk-*/episode_*.parquet"))
+
+            if not parquet_files:
+                raise FileNotFoundError(f"No parquet files found in {data_path}")
+
+            print(f"📁 找到 {len(parquet_files)} 个episode文件")
+
+            all_states = []
+            all_actions = []
+
+            for file_path in tqdm.tqdm(parquet_files, desc="Loading episodes"):
+                try:
+                    df = pd.read_parquet(file_path)
+
+                    # 提取状态和动作数据
+                    states = np.array([np.array(state)[:14] for state in df['observation.state']])
+                    actions = np.array([np.array(action)[:14] for action in df['action']])
+
+                    all_states.append(states)
+                    all_actions.append(actions)
+
+                except Exception as e:
+                    print(f"Error loading {file_path}: {e}")
+                    continue
+
+            # 合并所有数据
+            all_states = np.concatenate(all_states, axis=0)
+            all_actions = np.concatenate(all_actions, axis=0)
+
+            print(f"📊 总数据: {len(all_states)} 时间步")
+
+            # 为了与OpenPI兼容，需要将14维动作填充到32维
+            padded_actions = np.zeros((all_actions.shape[0], 32), dtype=all_actions.dtype)
+            padded_actions[:, :14] = all_actions
+
+            # 创建统计计算器
+            state_stats = _normalize.RunningStats()
+            action_stats = _normalize.RunningStats()
+
+            print("🧮 计算归一化统计信息...")
+
+            # 分批处理以避免内存问题
+            batch_size = 1000
+            num_batches = (len(all_states) + batch_size - 1) // batch_size
+
+            for i in tqdm.tqdm(range(num_batches), desc="Computing stats"):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, len(all_states))
+
+                batch_states = all_states[start_idx:end_idx]
+                batch_actions = padded_actions[start_idx:end_idx]
+
+                # 更新统计信息
+                state_stats.update(batch_states)
+                action_stats.update(batch_actions)
+
+            # 获取最终统计信息
+            norm_stats = {
+                "state": state_stats.get_statistics(),
+                "actions": action_stats.get_statistics()
+            }
+
+            # 保存统计信息
+            output_path.mkdir(parents=True, exist_ok=True)
+            _normalize.save(output_path, norm_stats)
+
+            print(f"✅ Norm stats自动计算完成并保存到: {output_path}")
+            print(f"   State mean range: [{norm_stats['state'].mean.min():.3f}, {norm_stats['state'].mean.max():.3f}]")
+            print(f"   Action mean range: [{norm_stats['actions'].mean.min():.3f}, {norm_stats['actions'].mean.max():.3f}]")
+
+            return norm_stats
+
+        except Exception as e:
+            print(f"❌ Norm stats自动计算失败: {e}")
+            print("🔄 将使用预训练norm stats")
+            return None
 
     def create(self, assets_dirs, model_config):
-        """创建数据配置实例 - 自动检测数据源"""
+        """创建数据配置实例 - 自动检测数据源并计算norm stats"""
         import os
+        from openpi.shared import normalize as _normalize
 
         print(f"🔍 检查数据路径: {self.data_path}")
 
         if os.path.exists(self.data_path):
             print(f"✅ 找到LeRobot格式茄子数据: {self.data_path}")
             print(f"📝 使用提示: {self.default_prompt}")
+
+            # 加载或计算自定义norm stats
+            norm_stats = None
+            if self.use_custom_norm_stats:
+                if self.auto_compute_norm_stats:
+                    # 自动计算norm stats
+                    norm_stats = self._compute_norm_stats_if_needed()
+                else:
+                    # 手动加载norm stats
+                    try:
+                        norm_stats_path = "assets/pick_and_place_eggplant"
+                        norm_stats = _normalize.load(norm_stats_path)
+                        print(f"✅ 加载现有norm stats: {norm_stats_path}")
+                        print(f"   State mean range: [{norm_stats['state'].mean.min():.3f}, {norm_stats['state'].mean.max():.3f}]")
+                        print(f"   Action mean range: [{norm_stats['actions'].mean.min():.3f}, {norm_stats['actions'].mean.max():.3f}]")
+                    except Exception as e:
+                        print(f"⚠️ 无法加载自定义norm stats: {e}")
+                        print("🔄 将使用预训练norm stats")
+
             print("🎯 启用真实数据训练！")
 
             # 使用真实茄子数据 - 参考LeRobotAlohaDataConfig的实现
@@ -122,8 +248,11 @@ class EggplantDataConfig(_config.DataConfigFactory):
 
             return _config.DataConfig(
                 repo_id="eggplant_real_data",  # 特殊标识符，我们会在数据加载器中处理
-                asset_id="trossen",  # 使用trossen的norm stats，因为我们的机器人配置类似ALOHA
+                asset_id="pick_and_place_eggplant" if norm_stats else "trossen",  # 使用自定义asset_id
+                norm_stats=norm_stats,  # 直接传入norm stats
                 model_transforms=model_transforms,  # 使用标准的model transforms
+                # 注意：local_files_only 和 data_dir 不是 DataConfig 的参数
+                # 这些配置需要在数据加载器中处理
             )
         else:
             print(f"⚠️  数据路径不存在: {self.data_path}")

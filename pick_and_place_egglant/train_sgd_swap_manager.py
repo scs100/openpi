@@ -30,6 +30,8 @@ matplotlib.use('Agg')  # 使用非交互式后端
 import numpy as np
 import io
 from contextlib import redirect_stdout, redirect_stderr
+import pandas as pd
+import tqdm
 
 sys.path.insert(0, os.path.abspath('.'))
 
@@ -69,7 +71,7 @@ SWAP_EMERGENCY_THRESHOLD = 70  # 紧急阈值 - 重度清理
 MONITOR_INTERVAL = 10          # 监控间隔(秒) - 平衡监控和性能
 
 # 实验配置
-EXPERIMENT_NAME = "sgd_swap_manager_20k_production"
+EXPERIMENT_NAME = "sgd_swap_manager_20k_norm_fix"
 WANDB_PROJECT = "openpi_eggplant_production"
 CHECKPOINT_PATH = "s3://openpi-assets/checkpoints/pi0_base/params"
 
@@ -785,7 +787,7 @@ def setup_logging():
     from log_utils import setup_test_logger
 
     # 创建日志文件和日志器
-    logger, log_file = setup_test_logger("sgd_swap_manager", "logs")
+    logger, log_file = setup_test_logger(str(EXPERIMENT_NAME), "logs")
 
     return logger, log_file
 
@@ -823,12 +825,172 @@ def log_system_memory(logger, step_name=""):
 
 
 
+def compute_norm_stats_if_needed(data_path, output_dir="assets/pick_and_place_eggplant"):
+    """如果不存在norm stats，则自动计算"""
+    from openpi.shared import normalize as _normalize
+
+    output_path = Path(output_dir)
+    norm_stats_file = output_path / "norm_stats.json"
+
+    # 检查是否已存在norm stats
+    if norm_stats_file.exists():
+        try:
+            norm_stats = _normalize.load(output_path)
+            logger.info(f"✅ 找到现有norm stats: {norm_stats_file}")
+            logger.info(f"   State shape: {norm_stats['state'].mean.shape}")
+            logger.info(f"   Action shape: {norm_stats['actions'].mean.shape}")
+            return norm_stats
+        except Exception as e:
+            logger.warning(f"⚠️ 现有norm stats损坏: {e}")
+            logger.info("🔄 重新计算norm stats...")
+    else:
+        logger.info(f"❌ 未找到norm stats: {norm_stats_file}")
+        logger.info("🔄 开始计算norm stats...")
+
+    # 自动计算norm stats
+    try:
+        data_path = Path(data_path)
+        parquet_files = list(data_path.glob("data/chunk-*/episode_*.parquet"))
+
+        if not parquet_files:
+            raise FileNotFoundError(f"No parquet files found in {data_path}")
+
+        logger.info(f"📁 找到 {len(parquet_files)} 个episode文件")
+
+        all_states = []
+        all_actions = []
+
+        for file_path in tqdm.tqdm(parquet_files, desc="Loading episodes"):
+            try:
+                df = pd.read_parquet(file_path)
+
+                # 提取状态和动作数据
+                states = np.array([np.array(state)[:14] for state in df['observation.state']])
+                actions = np.array([np.array(action)[:14] for action in df['action']])
+
+                all_states.append(states)
+                all_actions.append(actions)
+
+                logger.debug(f"Loaded {file_path.name}: {len(states)} steps")
+
+            except Exception as e:
+                logger.error(f"Error loading {file_path}: {e}")
+                continue
+
+        # 合并所有数据
+        all_states = np.concatenate(all_states, axis=0)
+        all_actions = np.concatenate(all_actions, axis=0)
+
+        logger.info(f"📊 总数据: {len(all_states)} 时间步")
+
+        # 为了与OpenPI兼容，需要将14维动作填充到32维
+        padded_actions = np.zeros((all_actions.shape[0], 32), dtype=all_actions.dtype)
+        padded_actions[:, :14] = all_actions
+
+        # 创建统计计算器
+        state_stats = _normalize.RunningStats()
+        action_stats = _normalize.RunningStats()
+
+        logger.info("🧮 计算归一化统计信息...")
+
+        # 分批处理以避免内存问题
+        batch_size = 1000
+        num_batches = (len(all_states) + batch_size - 1) // batch_size
+
+        for i in tqdm.tqdm(range(num_batches), desc="Computing stats"):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, len(all_states))
+
+            batch_states = all_states[start_idx:end_idx]
+            batch_actions = padded_actions[start_idx:end_idx]
+
+            # 更新统计信息
+            state_stats.update(batch_states)
+            action_stats.update(batch_actions)
+
+        # 获取最终统计信息
+        norm_stats = {
+            "state": state_stats.get_statistics(),
+            "actions": action_stats.get_statistics()
+        }
+
+        # 保存统计信息
+        output_path.mkdir(parents=True, exist_ok=True)
+        _normalize.save(output_path, norm_stats)
+
+        logger.info(f"✅ Norm stats计算完成并保存到: {output_path}")
+        logger.info(f"   State mean range: [{norm_stats['state'].mean.min():.3f}, {norm_stats['state'].mean.max():.3f}]")
+        logger.info(f"   Action mean range: [{norm_stats['actions'].mean.min():.3f}, {norm_stats['actions'].mean.max():.3f}]")
+
+        return norm_stats
+
+    except Exception as e:
+        logger.error(f"❌ Norm stats计算失败: {e}")
+        logger.error("🔄 将使用预训练norm stats")
+        return None
+
+
 def create_dynamic_training_config(initial_batch_size):
     """创建动态训练配置，支持OOM时自动降低批量大小"""
     import openpi.training.config as _config
     from openpi.models import pi0
     from openpi.training import optimizer as _optimizer
     from eggplant_train_config import EggplantDataConfig, CheckpointWeightLoader
+
+    # 自动计算或加载norm stats
+    logger.info("🔍 检查norm stats...")
+    norm_stats = compute_norm_stats_if_needed(EGGPLANT_DATA_PATH)
+
+    # 创建增强的数据配置
+    class EnhancedEggplantDataConfig(EggplantDataConfig):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.computed_norm_stats = norm_stats
+
+        def create(self, assets_dirs, model_config):
+            """创建数据配置实例 - 优先使用计算的norm stats"""
+            import os
+            from openpi.shared import normalize as _normalize
+
+            logger.info(f"🔍 检查数据路径: {self.data_path}")
+
+            if os.path.exists(self.data_path):
+                logger.info(f"✅ 找到LeRobot格式茄子数据: {self.data_path}")
+                logger.info(f"📝 使用提示: {self.default_prompt}")
+
+                # 优先使用计算的norm stats
+                final_norm_stats = self.computed_norm_stats
+                if final_norm_stats:
+                    logger.info("✅ 使用自动计算的norm stats")
+                else:
+                    # 回退到手动加载
+                    try:
+                        norm_stats_path = "assets/pick_and_place_eggplant"
+                        final_norm_stats = _normalize.load(norm_stats_path)
+                        logger.info(f"✅ 加载现有norm stats: {norm_stats_path}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 无法加载norm stats: {e}")
+                        logger.info("🔄 将使用预训练norm stats")
+                        final_norm_stats = None
+
+                logger.info("🎯 启用真实数据训练！")
+
+                # 创建model transforms
+                model_transforms = _config.ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+                return _config.DataConfig(
+                    repo_id="eggplant_real_data",
+                    asset_id="pick_and_place_eggplant" if final_norm_stats else "trossen",
+                    norm_stats=final_norm_stats,
+                    model_transforms=model_transforms,
+                )
+            else:
+                logger.warning(f"⚠️ 数据路径不存在: {self.data_path}")
+                logger.info("🔄 使用假数据进行测试")
+                return _config.DataConfig(
+                    repo_id="fake",
+                    asset_id="trossen",
+                )
 
     config = _config.TrainConfig(
         name="sgd_swap_manager",
@@ -843,8 +1005,8 @@ def create_dynamic_training_config(initial_batch_size):
             action_expert_variant=ACTION_EXPERT_VARIANT
         ),
 
-        # 数据配置 - 使用常量定义
-        data=EggplantDataConfig(
+        # 数据配置 - 使用增强版配置，自动处理norm stats
+        data=EnhancedEggplantDataConfig(
             data_path=EGGPLANT_DATA_PATH,
             default_prompt=DEFAULT_PROMPT
         ),
@@ -874,7 +1036,7 @@ def create_dynamic_training_config(initial_batch_size):
             nesterov=SGD_NESTEROV,
         ),
 
-        # 冻结配置 - 使用常量定义
+        # 冻结配置 - LoRA微调必须配置
         freeze_filter=pi0.Pi0Config(
             action_dim=ACTION_DIM,
             action_horizon=ACTION_HORIZON,
@@ -883,14 +1045,8 @@ def create_dynamic_training_config(initial_batch_size):
             action_expert_variant=ACTION_EXPERT_VARIANT
         ).get_freeze_filter(),
 
-        # 内存优化设置
+        # EMA配置 - LoRA微调必须禁用
         ema_decay=None,
-
-        # 实验配置 - 使用常量定义
-        exp_name=EXPERIMENT_NAME,
-        overwrite=OVERWRITE_CHECKPOINT,
-        resume=RESUME_TRAINING,
-        wandb_enabled=True,
     )
 
     return config
