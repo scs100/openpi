@@ -122,13 +122,15 @@ class EggplantDataConfig(_config.DataConfigFactory):
 
             return _config.DataConfig(
                 repo_id="eggplant_real_data",  # 特殊标识符，我们会在数据加载器中处理
+                asset_id="trossen",  # 使用trossen的norm stats，因为我们的机器人配置类似ALOHA
                 model_transforms=model_transforms,  # 使用标准的model transforms
             )
         else:
             print(f"⚠️  数据路径不存在: {self.data_path}")
             print("🔄 使用假数据进行LoRA微调测试")
-            return DataConfig(
+            return _config.DataConfig(
                 repo_id="fake",  # 使用假数据
+                asset_id="trossen",  # 统一使用trossen norm stats，保持一致性
             )
 
 # 快速测试配置 (10步验证) - LoRA版本
