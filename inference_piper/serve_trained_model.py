@@ -93,7 +93,12 @@ def create_policy(model_config: TrainedModelConfig):
     
     logger.info("模型加载成功!")
     return policy
+"""
+python inference_piper/serve_trained_model.py  \
+     --checkpoint_dir checkpoints/sgd_swap_manager/sgd_swap_manager_norm/16000   \
+     --config_name sgd_swap_manager
 
+"""
 def main():
     """主函数"""
     # 配置

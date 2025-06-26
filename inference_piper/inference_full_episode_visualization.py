@@ -377,39 +377,35 @@ class FullEpisodeInferenceVisualizer:
         }
     
     def create_full_episode_plot(self, results, save_path="full_episode_inference.png"):
-        """创建完整剧集的多步预测可视化"""
+        """Create multi-step prediction visualization for the full episode (English annotation, only plot t+1 prediction for all timesteps)"""
         
         gt_states = results['gt_states']
-        pred_states = results['pred_states']
+        pred_states = results['pred_states'][..., :14]  # Only first 14 dims
         future_steps = results['future_steps']
         
-        # 只取前14维，保证和gt一致
-        pred_states = pred_states[..., :14]
-        
-        # 检查数组维度
+        # Check array shapes
         if len(gt_states.shape) < 3 or len(pred_states.shape) < 3:
-            logger.error(f"数组维度错误: gt_states shape {gt_states.shape}, pred_states shape {pred_states.shape}")
-            logger.error("无法创建多步预测可视化，请确保返回了未来步骤的预测")
+            logger.error(f"Shape error: gt_states shape {gt_states.shape}, pred_states shape {pred_states.shape}")
+            logger.error("Cannot create multi-step prediction plot, please ensure future steps are returned.")
             return None
                 
         steps = np.arange(len(gt_states))
         
-        # 创建大型图表
+        # Create large figure
         fig = plt.figure(figsize=(20, 16))
         
-        # 主标题
+        # Main title
         episode_idx = results['episode_idx']
         total_steps = results['total_steps']
         avg_time = np.mean(results['inference_times'])
         
-        fig.suptitle(f'完整剧集 {episode_idx} 未来{future_steps}步预测分析 ({total_steps}步, '
-                    f'平均: {avg_time:.3f}秒/步, {1/avg_time:.1f} Hz)', 
+        fig.suptitle(f'Episode {episode_idx} t+1 Prediction (All Timesteps) ({total_steps} steps, Avg: {avg_time:.3f}s/step, {1/avg_time:.1f} Hz)', 
                     fontsize=16, fontweight='bold')
         
-        # 创建网格布局
+        # Grid layout
         gs = fig.add_gridspec(4, 4, hspace=0.3, wspace=0.3)
         
-        # 为每个关节绘制图表
+        # Plot for each joint
         for joint_idx in range(min(14, gt_states.shape[2])):
             row = joint_idx // 4
             col = joint_idx % 4
@@ -418,16 +414,16 @@ class FullEpisodeInferenceVisualizer:
             
             joint_name = self.joint_names[joint_idx]
             
-            # 只使用第一个未来步骤进行比较（当前时刻的预测）
+            # Only plot t+1 prediction for all timesteps
             try:
-                gt_values = gt_states[:, 0, joint_idx]  # 真实值第一步
-                pred_values = pred_states[:, 0, joint_idx]  # 预测值第一步
+                gt_values = gt_states[:, 0, joint_idx]  # ground truth t+1
+                pred_values = pred_states[:, 0, joint_idx]  # prediction t+1
                 
-                # 绘制当前时刻的比较
-                ax.plot(steps, gt_values, 'b-', linewidth=1.5, alpha=0.8, label='真实')
-                ax.plot(steps, pred_values, 'r-', linewidth=1.5, alpha=0.8, label='预测')
+                # Plot full episode
+                ax.plot(steps, gt_values, 'b-', linewidth=1.5, alpha=0.8, label='Ground Truth')
+                ax.plot(steps, pred_values, 'r-', linewidth=1.5, alpha=0.8, label='Prediction')
                 
-                # 计算并显示统计数据
+                # Compute and show statistics
                 mse = np.mean((pred_values - gt_values) ** 2)
                 mae = np.mean(np.abs(pred_values - gt_values))
                 
@@ -437,74 +433,28 @@ class FullEpisodeInferenceVisualizer:
                 else:
                     corr_text = 'N/A'
                 
-                ax.set_title(f'{joint_name}\nMAE:{mae:.3f} 相关:{corr_text}', fontsize=10)
-                ax.set_xlabel('步骤', fontsize=8)
-                ax.set_ylabel('值', fontsize=8)
+                ax.set_title(f'{joint_name}\nMAE:{mae:.3f} Corr:{corr_text}', fontsize=10)
+                ax.set_xlabel('Timestep', fontsize=8)
+                ax.set_ylabel('Value', fontsize=8)
                 ax.tick_params(labelsize=8)
                 ax.grid(True, alpha=0.3)
                 
-                if joint_idx == 0:  # 只在第一个图表上显示图例
+                if joint_idx == 0:  # Only show legend on the first plot
                     ax.legend(fontsize=8)
                     
             except IndexError:
-                logger.warning(f"获取关节 {joint_idx} 数据时发生索引错误，跳过该关节")
-                ax.set_title(f'{joint_name}\n数据不可用', fontsize=10)
-                ax.text(0.5, 0.5, '数据索引错误', 
+                logger.warning(f"Index error for joint {joint_idx}, skipping this joint")
+                ax.set_title(f'{joint_name}\nData unavailable', fontsize=10)
+                ax.text(0.5, 0.5, 'Index error', 
                         horizontalalignment='center',
                         verticalalignment='center',
                         transform=ax.transAxes)
                 continue
         
-        # 未来预测可视化 - 为前三个关节创建未来预测图表
-        for j_idx, joint_idx in enumerate([0, 1, 2]):  # 选择三个重要关节
-            if joint_idx < gt_states.shape[2]:
-                ax_future = fig.add_subplot(gs[3, j_idx])
-                
-                # 选择中间的时间步骤进行可视化
-                step_to_viz = len(gt_states) // 2
-                if step_to_viz < len(gt_states):
-                    # 获取未来步骤预测
-                    future_steps_to_show = min(future_steps, gt_states.shape[1])
-                    future_x = np.arange(future_steps_to_show)
-                    
-                    gt_future = gt_states[step_to_viz, :future_steps_to_show, joint_idx]
-                    pred_future = pred_states[step_to_viz, :future_steps_to_show, joint_idx]
-                    
-                    ax_future.plot(future_x, gt_future, 'b-', linewidth=2, label='真实')
-                    ax_future.plot(future_x, pred_future, 'r-', linewidth=2, label='预测')
-                    
-                    # 计算未来预测的MAE
-                    future_mae = np.mean(np.abs(pred_future - gt_future))
-                    
-                    ax_future.set_title(f'{self.joint_names[joint_idx]} 未来预测\n步骤 {step_to_viz}, MAE: {future_mae:.3f}', fontsize=10)
-                    ax_future.set_xlabel('未来步骤', fontsize=8)
-                    ax_future.set_ylabel('值', fontsize=8)
-                    ax_future.legend(fontsize=8)
-                    ax_future.grid(True, alpha=0.3)
-        
-        # 总体误差分析
-        ax_error = fig.add_subplot(gs[3, 3])
-        
-        # 计算不同预测步骤的误差
-        horizon_errors = []
-        for horizon in range(min(5, gt_states.shape[1])):  # 分析前5个预测步骤
-            if horizon < gt_states.shape[1] and horizon < pred_states.shape[1]:
-                step_errors = np.mean(np.abs(gt_states[:, horizon, :] - pred_states[:, horizon, :]), axis=1)
-                horizon_errors.append(np.mean(step_errors))
-        
-        if horizon_errors:
-            horizons = np.arange(len(horizon_errors))
-            ax_error.bar(horizons, horizon_errors, color='orange')
-            ax_error.set_title('不同预测步长的平均误差', fontsize=12, fontweight='bold')
-            ax_error.set_xlabel('预测步长')
-            ax_error.set_ylabel('平均绝对误差')
-            ax_error.set_xticks(horizons)
-            ax_error.grid(True, alpha=0.3)
-        
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logger.info(f"完整剧集多步预测图表已保存到: {save_path}")
+        logger.info(f"Full episode t+1 prediction plot saved to: {save_path}")
         
-        # 打印综合统计信息
+        # Print statistics
         self.print_multi_step_prediction_stats(results)
         
         return save_path
@@ -558,7 +508,9 @@ class FullEpisodeInferenceVisualizer:
 def main():
     """Main function"""
     import argparse
-    
+    """
+    python inference_piper/inference_full_episode_visualization.py --host localhost --port 8000 --data_path /home/q/data/pick_and_place_eggplant/openpi --episode 0 --step_limit 20 --output my_infer.png --future_steps 30 --debug
+    """
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="OpenPI完整剧集推理可视化")
     parser.add_argument("--host", default="localhost", help="推理服务器主机")
