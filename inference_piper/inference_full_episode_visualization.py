@@ -378,85 +378,61 @@ class FullEpisodeInferenceVisualizer:
     
     def create_full_episode_plot(self, results, save_path="full_episode_inference.png"):
         """Create multi-step prediction visualization for the full episode (English annotation, only plot t+1 prediction for all timesteps)"""
-        
         gt_states = results['gt_states']
         pred_states = results['pred_states'][..., :14]  # Only first 14 dims
         future_steps = results['future_steps']
-        
+
         # Check array shapes
         if len(gt_states.shape) < 3 or len(pred_states.shape) < 3:
             logger.error(f"Shape error: gt_states shape {gt_states.shape}, pred_states shape {pred_states.shape}")
             logger.error("Cannot create multi-step prediction plot, please ensure future steps are returned.")
             return None
-                
+
         steps = np.arange(len(gt_states))
-        
-        # Create large figure
-        fig = plt.figure(figsize=(20, 16))
-        
-        # Main title
-        episode_idx = results['episode_idx']
-        total_steps = results['total_steps']
-        avg_time = np.mean(results['inference_times'])
-        
-        fig.suptitle(f'Episode {episode_idx} t+1 Prediction (All Timesteps) ({total_steps} steps, Avg: {avg_time:.3f}s/step, {1/avg_time:.1f} Hz)', 
-                    fontsize=16, fontweight='bold')
-        
-        # Grid layout
-        gs = fig.add_gridspec(4, 4, hspace=0.3, wspace=0.3)
-        
-        # Plot for each joint
-        for joint_idx in range(min(14, gt_states.shape[2])):
-            row = joint_idx // 4
-            col = joint_idx % 4
-            
-            ax = fig.add_subplot(gs[row, col])
-            
+
+        # 一列14行，每个关节一行
+        fig, axes = plt.subplots(14, 1, figsize=(24, 3.5*14), sharex=True)
+        fig.subplots_adjust(hspace=0.35)
+        fig.suptitle(
+            f'Episode {results["episode_idx"]} t+1 Prediction (All Timesteps) ({results["total_steps"]} steps, Avg: {np.mean(results["inference_times"]):.3f}s/step, {1/np.mean(results["inference_times"]):.1f} Hz)',
+            fontsize=22, fontweight='bold'
+        )
+
+        for joint_idx in range(14):
+            ax = axes[joint_idx]
             joint_name = self.joint_names[joint_idx]
-            
-            # Only plot t+1 prediction for all timesteps
             try:
-                gt_values = gt_states[:, 0, joint_idx]  # ground truth t+1
-                pred_values = pred_states[:, 0, joint_idx]  # prediction t+1
-                
-                # Plot full episode
-                ax.plot(steps, gt_values, 'b-', linewidth=1.5, alpha=0.8, label='Ground Truth')
-                ax.plot(steps, pred_values, 'r-', linewidth=1.5, alpha=0.8, label='Prediction')
-                
-                # Compute and show statistics
+                gt_values = gt_states[:, 0, joint_idx]
+                pred_values = pred_states[:, 0, joint_idx]
+
+                ax.plot(steps, gt_values, color='royalblue', linewidth=2.5, label='Ground Truth')
+                ax.plot(steps, pred_values, color='orangered', linewidth=2.5, label='Prediction', linestyle='--')
+
                 mse = np.mean((pred_values - gt_values) ** 2)
                 mae = np.mean(np.abs(pred_values - gt_values))
-                
                 if np.std(gt_values) > 1e-6:
                     corr = np.corrcoef(gt_values, pred_values)[0, 1]
                     corr_text = f'{corr:.3f}'
                 else:
                     corr_text = 'N/A'
-                
-                ax.set_title(f'{joint_name}\nMAE:{mae:.3f} Corr:{corr_text}', fontsize=10)
-                ax.set_xlabel('Timestep', fontsize=8)
-                ax.set_ylabel('Value', fontsize=8)
-                ax.tick_params(labelsize=8)
+
+                ax.set_title(f'{joint_name}   MAE:{mae:.3f}   Corr:{corr_text}', fontsize=16)
+                ax.set_ylabel('Value', fontsize=14)
                 ax.grid(True, alpha=0.3)
-                
-                if joint_idx == 0:  # Only show legend on the first plot
-                    ax.legend(fontsize=8)
-                    
+                ax.tick_params(labelsize=12)
+                if joint_idx == 0:
+                    ax.legend(fontsize=14, loc='upper right')
             except IndexError:
-                logger.warning(f"Index error for joint {joint_idx}, skipping this joint")
-                ax.set_title(f'{joint_name}\nData unavailable', fontsize=10)
-                ax.text(0.5, 0.5, 'Index error', 
-                        horizontalalignment='center',
-                        verticalalignment='center',
-                        transform=ax.transAxes)
+                ax.set_title(f'{joint_name}\nData unavailable', fontsize=16)
+                ax.text(0.5, 0.5, 'Index error', ha='center', va='center', transform=ax.transAxes)
                 continue
-        
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+        axes[-1].set_xlabel('Timestep', fontsize=16)
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
         logger.info(f"Full episode t+1 prediction plot saved to: {save_path}")
-        
-        # Print statistics
+
         self.print_multi_step_prediction_stats(results)
-        
         return save_path
         
     def print_multi_step_prediction_stats(self, results):
