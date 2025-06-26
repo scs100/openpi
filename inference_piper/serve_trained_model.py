@@ -53,10 +53,8 @@ def create_trained_model_config(config_name: str = "sgd_swap_manager"):
 
         # 数据配置 - 使用训练时的norm stats
         data=EggplantDataConfig(
-            data_path="/home/testuser/data/pick_and_place_eggplant/openpi",
+            data_path="/home/q/data/pick_and_place_eggplant/openpi",
             default_prompt="pick and place purple long eggplant",
-            use_custom_norm_stats=True,
-            auto_compute_norm_stats=False  # 推理时不重新计算
         ),
 
         # 权重加载器
@@ -75,7 +73,7 @@ def create_policy(model_config: TrainedModelConfig):
         logger.error(f"检查点目录不存在: {model_config.checkpoint_dir}")
         
         # 列出可用的检查点
-        base_dir = Path("checkpoints/sgd_swap_manager/sgd_swap_manager_20k_production")
+        base_dir = Path("checkpoints/sgd_swap_manager/sgd_swap_manager_norm")
         if base_dir.exists():
             logger.info("可用的检查点:")
             for item in sorted(base_dir.iterdir()):
@@ -102,7 +100,7 @@ def main():
     model_config = TrainedModelConfig()
     
     # 检查可用的检查点
-    base_dir = Path("checkpoints/sgd_swap_manager/sgd_swap_manager_20k_production")
+    base_dir = Path("checkpoints/sgd_swap_manager/sgd_swap_manager_norm")
     if base_dir.exists():
         checkpoints = [item for item in sorted(base_dir.iterdir()) 
                       if item.is_dir() and item.name.isdigit()]

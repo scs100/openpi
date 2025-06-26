@@ -6,13 +6,26 @@ Complete episode inference with all timesteps
 
 import os
 import time
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
-import logging
-from openpi_client import websocket_client_policy
+import sys
+from PIL import Image
+import io
+
+# 检查依赖项
+try:
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from pathlib import Path
+    import logging
+    from openpi_client import websocket_client_policy
+    import argparse
+    import traceback
+except ImportError as e:
+    print(f"缺少必要的依赖项: {e}")
+    print("请确保已安装所有依赖项，可通过以下命令安装：")
+    print("pip install numpy pandas matplotlib seaborn pillow")
+    sys.exit(1)
 
 # Set clean style
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -23,15 +36,20 @@ plt.rcParams['font.size'] = 9
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def decode_image(img_bytes):
+    img = Image.open(io.BytesIO(img_bytes))
+    return np.array(img)
+
 class FullEpisodeInferenceVisualizer:
     """Full episode inference visualizer"""
     
-    def __init__(self, host="localhost", port=8000, data_path="/home/testuser/data/pick_and_place_eggplant/openpi"):
+    def __init__(self, host="localhost", port=8000, data_path="/home/q/data/pick_and_place_eggplant/openpi", debug=False):
         self.host = host
         self.port = port
         self.data_path = Path(data_path)
         self.policy = None
         self.gt_data = None
+        self.debug = debug
         
         # Joint names for 14-dimensional actions
         self.joint_names = [
@@ -62,27 +80,55 @@ class FullEpisodeInferenceVisualizer:
         for file_path in parquet_files:
             try:
                 df = pd.read_parquet(file_path)
+                
+                # 检查实际可用的相机和数据结构
+                if self.debug and len(df) > 0:
+                    logger.info(f"Parquet文件结构分析 ({file_path.name}):")
+                    logger.info(f"列名: {list(df.columns)}")
+                    
+                    # 检查相机列
+                    camera_cols = [col for col in df.columns if 'image' in col.lower()]
+                    logger.info(f"可能的相机列: {camera_cols}")
+                    
+                    # 检查状态向量维度
+                    if 'observation.state' in df.columns and len(df['observation.state']) > 0:
+                        first_state = df['observation.state'].iloc[0]
+                        logger.info(f"状态向量维度: {len(first_state) if isinstance(first_state, (list, tuple)) else 'unknown'}")
+                
+                # 加载动作和状态数据
                 actions = np.array([np.array(action)[:14] for action in df['action']])
                 states = np.array([np.array(state)[:14] for state in df['observation.state']])
                 
+                # 收集图像数据（如果存在）
+                image_columns = [col for col in df.columns if 'image' in col.lower()]
+                
+                # 存储列名到数据字典中，用于后续格式确定
+                column_names = list(df.columns)
+                
+                # 直接存储原始数据帧引用，这样我们在推理时可以直接访问
                 episode_data = {
                     'episode_file': file_path.name,
                     'actions': actions,
                     'states': states,
+                    'df': df,  # 存储整个数据帧
+                    'image_columns': image_columns,  # 存储图像列名
+                    'column_names': column_names,  # 存储所有列名
                     'length': len(actions)
                 }
                 all_data.append(episode_data)
-                logger.info(f"Loaded {file_path.name}: {len(actions)} steps")
+                logger.info(f"已加载 {file_path.name}：{len(actions)}步，状态形状{states.shape}，动作形状{actions.shape}，图像列数量{len(image_columns)}")
                 
             except Exception as e:
-                logger.error(f"Failed to load {file_path}: {e}")
+                logger.error(f"无法加载 {file_path}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
                 continue
         
         self.gt_data = all_data
         return len(all_data) > 0
     
-    def run_full_episode_inference(self, episode_idx=0, step_limit=None):
-        """Run inference for full episode"""
+    def run_full_episode_inference(self, episode_idx=0, step_limit=None, max_consecutive_errors=10, future_steps=30):
+        """执行完整剧集推理，预测未来30个时刻的状态"""
         if not self.gt_data or episode_idx >= len(self.gt_data):
             return None
             
@@ -90,281 +136,500 @@ class FullEpisodeInferenceVisualizer:
         total_steps = episode['length']
         
         if step_limit is not None:
-            max_steps = min(step_limit, total_steps)
+            max_steps = min(step_limit, total_steps - future_steps)  # 确保有足够的步骤进行未来预测
         else:
-            max_steps = total_steps
+            max_steps = total_steps - future_steps
             
-        logger.info(f"Running full episode inference: {max_steps}/{total_steps} steps")
+        logger.info(f"执行完整剧集推理：{max_steps}/{total_steps}步，每步预测未来{future_steps}个时刻")
         
-        gt_actions = []
-        pred_actions = []
+        gt_states = []
+        pred_states = []
         inference_times = []
+        
+        success_count = 0
+        consecutive_errors = 0
+        
+        # 使用OpenPI的tokenizer
+        try:
+            # 尝试导入tokenizer
+            from openpi.models import tokenizer
+            logger.info("成功导入OpenPI tokenizer模块")
+            have_tokenizer = True
+        except ImportError:
+            logger.warning("无法导入OpenPI tokenizer模块，将使用占位符")
+            have_tokenizer = False
+        
+        prompt_text = "pick and place purple long eggplant"
+        
+        # 创建一个通用的tokenize函数
+        def simple_tokenize(text, max_length=48):
+            """简单的tokenize函数，将每个字符转为ASCII码"""
+            tokens = [ord(c) % 1000 for c in text]  # 使用ASCII值模1000作为简单token
+            # 添加批次维度并填充到指定长度
+            result = np.zeros((1, max_length), dtype=np.int32)
+            mask = np.zeros((1, max_length), dtype=bool)
+            length = min(len(tokens), max_length)
+            result[0, :length] = tokens[:length]
+            mask[0, :length] = True
+            return result, mask
+        
+        # 定义映射关系
+        image_key_map = {
+            "exterior_image_1_left": "base_0_rgb",
+            "wrist_image_left": "left_wrist_0_rgb",
+            "wrist_image_right": "right_wrist_0_rgb"
+        }
         
         for step_idx in range(max_steps):
             try:
-                # Create observation
-                state = episode['states'][step_idx]
+                # 获取当前步骤的真实状态
+                current_state = episode['states'][step_idx]
+                
+                # 将14维状态向量扩展到32维以匹配服务器期望
+                padded_state = np.zeros(32, dtype=np.float32)
+                padded_state[:len(current_state)] = current_state
+                
+                # 获取图像数据 - 直接从数据帧获取
+                df = episode['df']
+                image_columns = episode['image_columns']
+                
+                # 准备图像数据字典 - 使用ALOHA格式
+                images = {}
+                
+                if image_columns:
+                    row = df.iloc[step_idx]
+                    for col in image_columns:
+                        if '.' in col:
+                            cam_name = col.split('.')[-1]
+                        else:
+                            cam_name = col
+                        img_data = row[col]
+                        if img_data is not None:
+                            mapped_key = image_key_map.get(cam_name, cam_name)
+                            if isinstance(img_data, dict) and 'bytes' in img_data:
+                                images[mapped_key] = decode_image(img_data['bytes'])
+                            elif isinstance(img_data, bytes):
+                                images[mapped_key] = decode_image(img_data)
+                            else:
+                                images[mapped_key] = img_data
+                
+                # 检查是否有图像数据
+                if not images:
+                    raise ValueError(f"步骤 {step_idx} 没有有效的图像数据。列: {image_columns}")
+                
+                # 使用OpenPI tokenizer处理提示词
+                if have_tokenizer:
+                    tokens, tokenized_prompt_mask = simple_tokenize(prompt_text)
+                else:
+                    # 没有tokenizer时的后备方案
+                    tokens = np.zeros((1, 48), dtype=np.int32)
+                    tokenized_prompt_mask = np.ones((1, 48), dtype=bool)
+                
                 obs = {
-                    "state": state.astype(np.float32),
-                    "images": {
-                        "cam_high": np.random.randint(0, 256, size=(3, 224, 224), dtype=np.uint8),
-                        "cam_low": np.random.randint(0, 256, size=(3, 224, 224), dtype=np.uint8),
-                        "cam_left_wrist": np.random.randint(0, 256, size=(3, 224, 224), dtype=np.uint8),
-                        "cam_right_wrist": np.random.randint(0, 256, size=(3, 224, 224), dtype=np.uint8),
-                    },
-                    "prompt": "pick and place purple long eggplant"
+                    "state": padded_state,
+                    "image": images,
+                    "prompt": prompt_text,
+                    "tokenized_prompt": tokens,
+                    "tokenized_prompt_mask": tokenized_prompt_mask
                 }
                 
-                # Execute inference
+                # 在调试模式下打印更多信息
+                if self.debug and step_idx == 0:
+                    logger.info("=== 推理前输入结构 ===")
+                    logger.info(f"obs['state'] 类型: {type(obs['state'])}, 形状: {getattr(obs['state'], 'shape', None)}")
+                    for k, v in obs['image'].items():
+                        logger.info(f"obs['image'][{k}] 类型: {type(v)}")
+                        if hasattr(v, 'shape'):
+                            logger.info(f"obs['image'][{k}] 形状: {v.shape}")
+                        elif isinstance(v, bytes):
+                            logger.info(f"obs['image'][{k}] bytes 长度: {len(v)}")
+                        elif isinstance(v, dict):
+                            logger.info(f"obs['image'][{k}] dict keys: {list(v.keys())}")
+                    # for k, v in image_mask_dict.items():
+                    #     assert v.shape == (224, 224), f"{k} mask shape 错误: {v.shape}"
+                    logger.info("====================")
+                
+                # 执行推理
                 start_time = time.time()
+                if self.policy is None:
+                    raise ValueError("策略未初始化 - 服务器连接失败")
+                    
                 result = self.policy.infer(obs)
                 inference_time = time.time() - start_time
                 
-                # Store results
-                gt_action = episode['actions'][step_idx]
-                pred_action = result["actions"][0]  # Current timestep prediction
+                # 获取预测的状态而不是动作
+                # 注意：在result中，我们需要查找状态键而不是动作键
+                # 一般是 "state" 或 "predicted_state" 或 "future_states"
+                if "state" in result:
+                    pred_state_key = "state"
+                elif "predicted_state" in result:
+                    pred_state_key = "predicted_state"
+                elif "future_states" in result:
+                    pred_state_key = "future_states"
+                elif "states" in result:
+                    pred_state_key = "states"
+                else:
+                    # 如果没有状态键，我们只能使用动作作为后备
+                    logger.warning("在结果中找不到状态键，尝试使用动作")
+                    pred_state_key = "actions"
                 
-                gt_actions.append(gt_action)
-                pred_actions.append(pred_action)
+                # 记录首次返回的数据结构
+                if step_idx == 0:
+                    logger.info(f"返回的结果结构: {type(result)}")
+                    logger.info(f"结果键: {list(result.keys())}")
+                    logger.info(f"使用键 '{pred_state_key}' 获取预测状态")
+                    if pred_state_key in result:
+                        pred_data = result[pred_state_key]
+                        logger.info(f"预测数据类型: {type(pred_data)}, 形状: {np.array(pred_data).shape if hasattr(pred_data, 'shape') else 'unknown'}")
+                
+                # 获取当前和未来步骤的真实状态
+                gt_state_current = current_state
+                gt_states_future = []
+                for i in range(future_steps):
+                    if step_idx + i < len(episode['states']):
+                        gt_states_future.append(episode['states'][step_idx + i])
+                    else:
+                        # 如果超出范围，用最后一个状态填充
+                        gt_states_future.append(episode['states'][-1])
+                
+                # 从结果中获取预测状态
+                if pred_state_key in result:
+                    pred_states_data = result[pred_state_key]
+                    
+                    # 如果只返回了当前状态
+                    if not isinstance(pred_states_data, (list, tuple)) or len(pred_states_data) == 1:
+                        pred_states_future = [pred_states_data] * future_steps
+                    else:
+                        # 如果返回了多个未来状态
+                        pred_states_future = pred_states_data[:future_steps]
+                        # 如果返回的状态少于需要的未来步骤，用最后一个状态填充
+                        if len(pred_states_future) < future_steps:
+                            last_state = pred_states_future[-1]
+                            # 将列表转换为可变类型（如果是元组）
+                            if isinstance(pred_states_future, tuple):
+                                pred_states_future = list(pred_states_future)
+                            # 添加额外的状态
+                            for _ in range(future_steps - len(pred_states_future)):
+                                pred_states_future.append(last_state)
+                else:
+                    # 如果没有找到预测状态，使用当前状态作为预测（简单的持久性预测）
+                    logger.warning(f"在结果中找不到键 '{pred_state_key}'，使用持久性预测")
+                    pred_states_future = [current_state] * future_steps
+                
+                # 存储结果
+                gt_states.append(gt_states_future)
+                pred_states.append(pred_states_future)
+                
                 inference_times.append(inference_time)
+                success_count += 1
+                consecutive_errors = 0  # 重置连续错误计数
                 
-                # Progress logging
+                # 进度日志
                 if step_idx % 20 == 0 or step_idx == max_steps - 1:
-                    logger.info(f"Progress: {step_idx+1}/{max_steps} steps, "
-                              f"avg time: {np.mean(inference_times):.3f}s")
+                    logger.info(f"进度: {step_idx+1}/{max_steps}步, "
+                              f"平均时间: {np.mean(inference_times):.3f}秒, "
+                              f"成功率: {success_count/(step_idx+1)*100:.1f}%")
                     
             except Exception as e:
-                logger.error(f"Step {step_idx} failed: {e}")
+                logger.error(f"步骤 {step_idx} 失败: {e}")
+                # 记录详细的错误信息和堆栈跟踪
+                logger.error(f"详细错误: {traceback.format_exc()}")
+                
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"连续出现{consecutive_errors}个错误，中止处理")
+                    break
+                
+                # 尝试重新连接服务器
+                if "connection" in str(e).lower() or "websocket" in str(e).lower():
+                    logger.info("尝试重新连接服务器...")
+                    try:
+                        self.policy = websocket_client_policy.WebsocketClientPolicy(
+                            host=self.host, port=self.port
+                        )
+                        logger.info("服务器重连成功")
+                    except Exception as reconnect_error:
+                        logger.error(f"服务器重连失败: {reconnect_error}")
+                        
                 continue
         
+        # 检查是否有成功的推理结果
+        if not gt_states or not pred_states:
+            logger.error("没有成功的推理步骤，无法生成结果")
+            return None
+            
+        # 转换为numpy数组
+        gt_states_array = np.array(gt_states)
+        pred_states_array = np.array(pred_states)
+        
+        # 验证数组维度
+        logger.info(f"完成推理: {len(gt_states)}/{max_steps}步骤成功, "
+                   f"gt_shape={gt_states_array.shape}, pred_shape={pred_states_array.shape}")
+        
         return {
-            'gt_actions': np.array(gt_actions),
-            'pred_actions': np.array(pred_actions),
+            'gt_states': gt_states_array,
+            'pred_states': pred_states_array,
             'inference_times': np.array(inference_times),
             'episode_idx': episode_idx,
             'episode_file': episode['episode_file'],
-            'total_steps': len(gt_actions)
+            'total_steps': len(gt_states),
+            'future_steps': future_steps
         }
     
     def create_full_episode_plot(self, results, save_path="full_episode_inference.png"):
-        """Create comprehensive full episode plot"""
+        """创建完整剧集的多步预测可视化"""
         
-        gt_actions = results['gt_actions']
-        pred_actions = results['pred_actions']
-        steps = np.arange(len(gt_actions))
+        gt_states = results['gt_states']
+        pred_states = results['pred_states']
+        future_steps = results['future_steps']
         
-        # Create large figure with subplots
+        # 只取前14维，保证和gt一致
+        pred_states = pred_states[..., :14]
+        
+        # 检查数组维度
+        if len(gt_states.shape) < 3 or len(pred_states.shape) < 3:
+            logger.error(f"数组维度错误: gt_states shape {gt_states.shape}, pred_states shape {pred_states.shape}")
+            logger.error("无法创建多步预测可视化，请确保返回了未来步骤的预测")
+            return None
+                
+        steps = np.arange(len(gt_states))
+        
+        # 创建大型图表
         fig = plt.figure(figsize=(20, 16))
         
-        # Main title
+        # 主标题
         episode_idx = results['episode_idx']
         total_steps = results['total_steps']
         avg_time = np.mean(results['inference_times'])
         
-        fig.suptitle(f'Complete Episode {episode_idx} Inference Analysis ({total_steps} steps, '
-                    f'avg: {avg_time:.3f}s/step, {1/avg_time:.1f} Hz)', 
+        fig.suptitle(f'完整剧集 {episode_idx} 未来{future_steps}步预测分析 ({total_steps}步, '
+                    f'平均: {avg_time:.3f}秒/步, {1/avg_time:.1f} Hz)', 
                     fontsize=16, fontweight='bold')
         
-        # Create grid layout: 4 rows x 4 columns for 14 joints + 2 summary plots
+        # 创建网格布局
         gs = fig.add_gridspec(4, 4, hspace=0.3, wspace=0.3)
         
-        # Plot each joint (14 joints in 4x4 grid, leaving 2 spaces for summary)
-        for joint_idx in range(14):
+        # 为每个关节绘制图表
+        for joint_idx in range(min(14, gt_states.shape[2])):
             row = joint_idx // 4
             col = joint_idx % 4
             
             ax = fig.add_subplot(gs[row, col])
             
             joint_name = self.joint_names[joint_idx]
-            gt_values = gt_actions[:, joint_idx]
-            pred_values = pred_actions[:, joint_idx]
             
-            # Plot ground truth and prediction
-            ax.plot(steps, gt_values, 'b-', linewidth=1.5, alpha=0.8, label='GT')
-            ax.plot(steps, pred_values, 'r-', linewidth=1.5, alpha=0.8, label='Pred')
-            
-            # Calculate and display statistics
-            mse = np.mean((pred_values - gt_values) ** 2)
-            mae = np.mean(np.abs(pred_values - gt_values))
-            
-            if np.std(gt_values) > 1e-6:
-                corr = np.corrcoef(gt_values, pred_values)[0, 1]
-                corr_text = f'{corr:.3f}'
-            else:
-                corr_text = 'N/A'
-            
-            ax.set_title(f'{joint_name}\nMAE:{mae:.3f} Corr:{corr_text}', fontsize=10)
-            ax.set_xlabel('Step', fontsize=8)
-            ax.set_ylabel('Value', fontsize=8)
-            ax.tick_params(labelsize=8)
-            ax.grid(True, alpha=0.3)
-            
-            if joint_idx == 0:  # Only show legend on first plot
-                ax.legend(fontsize=8)
-        
-        # Summary plot 1: Overall error trends (bottom left)
-        ax_error = fig.add_subplot(gs[3, 2])
-        
-        # Calculate overall error metrics
-        errors = np.abs(pred_actions - gt_actions)
-        avg_error_per_step = np.mean(errors, axis=1)
-        max_error_per_step = np.max(errors, axis=1)
-        
-        ax_error.plot(steps, avg_error_per_step, 'orange', linewidth=2, label='Avg Error')
-        ax_error.fill_between(steps, 0, avg_error_per_step, alpha=0.3, color='orange')
-        ax_error.plot(steps, max_error_per_step, 'red', linewidth=1, alpha=0.7, label='Max Error')
-        
-        ax_error.set_title('Error Evolution Over Time', fontsize=12, fontweight='bold')
-        ax_error.set_xlabel('Time Step')
-        ax_error.set_ylabel('Absolute Error')
-        ax_error.legend()
-        ax_error.grid(True, alpha=0.3)
-        
-        # Summary plot 2: Performance metrics (bottom right)
-        ax_metrics = fig.add_subplot(gs[3, 3])
-        
-        # Calculate rolling performance metrics
-        window_size = max(5, len(steps) // 20)
-        if len(steps) >= window_size:
-            rolling_mse = []
-            rolling_mae = []
-            rolling_corr = []
-            
-            for i in range(window_size-1, len(steps)):
-                start_idx = i - window_size + 1
-                end_idx = i + 1
+            # 只使用第一个未来步骤进行比较（当前时刻的预测）
+            try:
+                gt_values = gt_states[:, 0, joint_idx]  # 真实值第一步
+                pred_values = pred_states[:, 0, joint_idx]  # 预测值第一步
                 
-                window_gt = gt_actions[start_idx:end_idx].flatten()
-                window_pred = pred_actions[start_idx:end_idx].flatten()
+                # 绘制当前时刻的比较
+                ax.plot(steps, gt_values, 'b-', linewidth=1.5, alpha=0.8, label='真实')
+                ax.plot(steps, pred_values, 'r-', linewidth=1.5, alpha=0.8, label='预测')
                 
-                mse = np.mean((window_pred - window_gt) ** 2)
-                mae = np.mean(np.abs(window_pred - window_gt))
+                # 计算并显示统计数据
+                mse = np.mean((pred_values - gt_values) ** 2)
+                mae = np.mean(np.abs(pred_values - gt_values))
                 
-                if np.std(window_gt) > 1e-6:
-                    corr = np.corrcoef(window_gt, window_pred)[0, 1]
+                if np.std(gt_values) > 1e-6:
+                    corr = np.corrcoef(gt_values, pred_values)[0, 1]
+                    corr_text = f'{corr:.3f}'
                 else:
-                    corr = 0
+                    corr_text = 'N/A'
                 
-                rolling_mse.append(mse)
-                rolling_mae.append(mae)
-                rolling_corr.append(corr)
-            
-            rolling_steps = steps[window_size-1:]
-            
-            ax_metrics_twin = ax_metrics.twinx()
-            
-            line1 = ax_metrics.plot(rolling_steps, rolling_mse, 'r-', label='MSE', linewidth=2)
-            line2 = ax_metrics.plot(rolling_steps, rolling_mae, 'b-', label='MAE', linewidth=2)
-            line3 = ax_metrics_twin.plot(rolling_steps, rolling_corr, 'g-', label='Correlation', linewidth=2)
-            
-            ax_metrics.set_xlabel('Time Step')
-            ax_metrics.set_ylabel('MSE / MAE', color='black')
-            ax_metrics_twin.set_ylabel('Correlation', color='green')
-            
-            # Combine legends
-            lines = line1 + line2 + line3
-            labels = [l.get_label() for l in lines]
-            ax_metrics.legend(lines, labels, loc='upper right')
+                ax.set_title(f'{joint_name}\nMAE:{mae:.3f} 相关:{corr_text}', fontsize=10)
+                ax.set_xlabel('步骤', fontsize=8)
+                ax.set_ylabel('值', fontsize=8)
+                ax.tick_params(labelsize=8)
+                ax.grid(True, alpha=0.3)
+                
+                if joint_idx == 0:  # 只在第一个图表上显示图例
+                    ax.legend(fontsize=8)
+                    
+            except IndexError:
+                logger.warning(f"获取关节 {joint_idx} 数据时发生索引错误，跳过该关节")
+                ax.set_title(f'{joint_name}\n数据不可用', fontsize=10)
+                ax.text(0.5, 0.5, '数据索引错误', 
+                        horizontalalignment='center',
+                        verticalalignment='center',
+                        transform=ax.transAxes)
+                continue
         
-        ax_metrics.set_title(f'Rolling Metrics (window={window_size})', fontsize=12, fontweight='bold')
-        ax_metrics.grid(True, alpha=0.3)
+        # 未来预测可视化 - 为前三个关节创建未来预测图表
+        for j_idx, joint_idx in enumerate([0, 1, 2]):  # 选择三个重要关节
+            if joint_idx < gt_states.shape[2]:
+                ax_future = fig.add_subplot(gs[3, j_idx])
+                
+                # 选择中间的时间步骤进行可视化
+                step_to_viz = len(gt_states) // 2
+                if step_to_viz < len(gt_states):
+                    # 获取未来步骤预测
+                    future_steps_to_show = min(future_steps, gt_states.shape[1])
+                    future_x = np.arange(future_steps_to_show)
+                    
+                    gt_future = gt_states[step_to_viz, :future_steps_to_show, joint_idx]
+                    pred_future = pred_states[step_to_viz, :future_steps_to_show, joint_idx]
+                    
+                    ax_future.plot(future_x, gt_future, 'b-', linewidth=2, label='真实')
+                    ax_future.plot(future_x, pred_future, 'r-', linewidth=2, label='预测')
+                    
+                    # 计算未来预测的MAE
+                    future_mae = np.mean(np.abs(pred_future - gt_future))
+                    
+                    ax_future.set_title(f'{self.joint_names[joint_idx]} 未来预测\n步骤 {step_to_viz}, MAE: {future_mae:.3f}', fontsize=10)
+                    ax_future.set_xlabel('未来步骤', fontsize=8)
+                    ax_future.set_ylabel('值', fontsize=8)
+                    ax_future.legend(fontsize=8)
+                    ax_future.grid(True, alpha=0.3)
+        
+        # 总体误差分析
+        ax_error = fig.add_subplot(gs[3, 3])
+        
+        # 计算不同预测步骤的误差
+        horizon_errors = []
+        for horizon in range(min(5, gt_states.shape[1])):  # 分析前5个预测步骤
+            if horizon < gt_states.shape[1] and horizon < pred_states.shape[1]:
+                step_errors = np.mean(np.abs(gt_states[:, horizon, :] - pred_states[:, horizon, :]), axis=1)
+                horizon_errors.append(np.mean(step_errors))
+        
+        if horizon_errors:
+            horizons = np.arange(len(horizon_errors))
+            ax_error.bar(horizons, horizon_errors, color='orange')
+            ax_error.set_title('不同预测步长的平均误差', fontsize=12, fontweight='bold')
+            ax_error.set_xlabel('预测步长')
+            ax_error.set_ylabel('平均绝对误差')
+            ax_error.set_xticks(horizons)
+            ax_error.grid(True, alpha=0.3)
         
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logger.info(f"Full episode plot saved to: {save_path}")
+        logger.info(f"完整剧集多步预测图表已保存到: {save_path}")
         
-        # Print comprehensive statistics
-        self.print_full_episode_stats(results)
+        # 打印综合统计信息
+        self.print_multi_step_prediction_stats(results)
         
         return save_path
-    
-    def print_full_episode_stats(self, results):
-        """Print comprehensive episode statistics"""
         
-        gt_actions = results['gt_actions']
-        pred_actions = results['pred_actions']
+    def print_multi_step_prediction_stats(self, results):
+        """打印多步预测的综合统计信息"""
+        
+        gt_states = results['gt_states']
+        pred_states = results['pred_states']
+        future_steps = results['future_steps']
+        
+        # 只取前 14 维
+        pred_states = pred_states[..., :14]
         
         print("\n" + "="*90)
-        print(f"📊 COMPLETE EPISODE {results['episode_idx']} INFERENCE ANALYSIS")
+        print(f"📊 完整剧集 {results['episode_idx']} 未来{future_steps}步预测分析")
         print("="*90)
-        print(f"Episode File: {results['episode_file']}")
-        print(f"Total Steps Analyzed: {results['total_steps']}")
-        print(f"Average Inference Time: {np.mean(results['inference_times']):.3f}s")
-        print(f"Inference Frequency: {1/np.mean(results['inference_times']):.1f} Hz")
-        print(f"Total Inference Time: {np.sum(results['inference_times']):.1f}s")
+        print(f"数据文件: {results['episode_file']}")
+        print(f"分析步骤总数: {results['total_steps']}")
+        print(f"平均推理时间: {np.mean(results['inference_times']):.3f}秒")
+        print(f"推理频率: {1/np.mean(results['inference_times']):.1f} Hz")
+        print(f"总推理时间: {np.sum(results['inference_times']):.1f}秒")
         print("-"*90)
         
-        # Overall statistics
-        overall_mse = np.mean((pred_actions - gt_actions) ** 2)
-        overall_mae = np.mean(np.abs(pred_actions - gt_actions))
-        overall_corr = np.corrcoef(gt_actions.flatten(), pred_actions.flatten())[0, 1]
+        # 按预测步长计算统计数据
+        print(f"按预测步长的性能统计:")
+        print(f"{'步长':<8} {'MSE':<12} {'MAE':<12} {'相关系数':<12}")
+        print("-"*50)
         
-        print(f"OVERALL PERFORMANCE:")
-        print(f"  MSE: {overall_mse:.6f}")
-        print(f"  MAE: {overall_mae:.6f}")
-        print(f"  Correlation: {overall_corr:.6f}")
-        print(f"  Max Error: {np.max(np.abs(pred_actions - gt_actions)):.6f}")
-        print(f"  Min Error: {np.min(np.abs(pred_actions - gt_actions)):.6f}")
-        print("-"*90)
+        max_steps_to_analyze = min(5, gt_states.shape[1], pred_states.shape[1])
         
-        # Per-joint statistics
-        print(f"PER-JOINT PERFORMANCE:")
-        print(f"{'Joint':<15} {'MSE':<10} {'MAE':<10} {'Corr':<8} {'Max_Err':<10} {'Range_GT':<12}")
-        print("-"*90)
-        
-        for joint_idx in range(14):
-            joint_name = self.joint_names[joint_idx]
-            gt_values = gt_actions[:, joint_idx]
-            pred_values = pred_actions[:, joint_idx]
+        for step in range(max_steps_to_analyze):
+            # 获取特定预测步长的所有数据点
+            gt_horizon = gt_states[:, step, :].reshape(-1)
+            pred_horizon = pred_states[:, step, :].reshape(-1)
             
-            mse = np.mean((pred_values - gt_values) ** 2)
-            mae = np.mean(np.abs(pred_values - gt_values))
-            max_error = np.max(np.abs(pred_values - gt_values))
-            gt_range = np.max(gt_values) - np.min(gt_values)
+            # 计算统计数据
+            mse = np.mean((pred_horizon - gt_horizon) ** 2)
+            mae = np.mean(np.abs(pred_horizon - gt_horizon))
             
-            if np.std(gt_values) > 1e-6:
-                corr = np.corrcoef(gt_values, pred_values)[0, 1]
-                corr_str = f"{corr:.3f}"
+            if np.std(gt_horizon) > 1e-6 and np.std(pred_horizon) > 1e-6:
+                corr = np.corrcoef(gt_horizon, pred_horizon)[0, 1]
+                corr_text = f"{corr:.4f}"
             else:
-                corr_str = "N/A"
+                corr_text = "N/A"
+                
+            print(f"{step:<8} {mse:<12.6f} {mae:<12.6f} {corr_text:<12}")
             
-            print(f"{joint_name:<15} {mse:<10.6f} {mae:<10.6f} {corr_str:<8} "
-                  f"{max_error:<10.6f} {gt_range:<12.6f}")
-        
         print("="*90)
 
 def main():
     """Main function"""
-    visualizer = FullEpisodeInferenceVisualizer()
+    import argparse
     
-    if not visualizer.connect_to_server():
-        logger.error("Cannot connect to inference server")
-        return
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="OpenPI完整剧集推理可视化")
+    parser.add_argument("--host", default="localhost", help="推理服务器主机")
+    parser.add_argument("--port", type=int, default=8000, help="推理服务器端口")
+    parser.add_argument("--data_path", default="/home/q/data/pick_and_place_eggplant/openpi", 
+                        help="数据路径")
+    parser.add_argument("--episode", type=int, default=0, help="要分析的剧集索引")
+    parser.add_argument("--step_limit", type=int, default=20, 
+                        help="步骤限制（设置为0表示不限制）")
+    parser.add_argument("--output", default="test_inference.png", 
+                        help="输出图像文件")
+    parser.add_argument("--full_run", action="store_true",
+                        help="完整运行（不推荐，除非确认小批量测试成功）")
+    parser.add_argument("--max_errors", type=int, default=1,
+                        help="允许的最大连续错误数，超过此数值将中止处理")
+    parser.add_argument("--debug", action="store_true",
+                        help="启用调试模式，打印更多信息")
+    parser.add_argument("--future_steps", type=int, default=30,
+                        help="要预测的未来步骤数量")
     
-    if not visualizer.load_gt_data():
-        logger.error("Cannot load ground truth data")
-        return
+    args = parser.parse_args()
     
-    # Choose episode and step limit
-    episode_to_analyze = 0  # Change this to analyze different episodes
-    step_limit = 6000  # Set to None for complete episode, or limit for faster processing
+    # 如果设置为0表示不限制
+    step_limit = None if args.step_limit == 0 else args.step_limit
     
-    logger.info(f"Starting full episode analysis for episode {episode_to_analyze}...")
-    
-    # Run full episode inference
-    results = visualizer.run_full_episode_inference(
-        episode_idx=episode_to_analyze, 
-        step_limit=step_limit
-    )
-    
-    if results is None:
-        logger.error("Failed to run inference")
-        return
-    
-    # Create comprehensive visualization
-    save_path = f"full_episode_{episode_to_analyze}_inference.png"
-    visualizer.create_full_episode_plot(results, save_path)
-    
-    logger.info("Full episode visualization completed!")
+    try:
+        # 初始化可视化器
+        visualizer = FullEpisodeInferenceVisualizer(
+            host=args.host, 
+            port=args.port, 
+            data_path=args.data_path,
+            debug=args.debug
+        )
+        
+        # 连接服务器
+        if not visualizer.connect_to_server():
+            logger.error("无法连接到推理服务器，请确保服务器正在运行")
+            return 1
+        
+        # 加载数据
+        if not visualizer.load_gt_data():
+            logger.error("无法加载地面真值数据，请检查数据路径")
+            return 1
+        
+        logger.info(f"开始为剧集 {args.episode} 进行完整分析...")
+        
+        # 运行完整剧集推理
+        results = visualizer.run_full_episode_inference(
+            episode_idx=args.episode, 
+            step_limit=step_limit,
+            max_consecutive_errors=args.max_errors,
+            future_steps=args.future_steps
+        )
+        
+        if results is None:
+            logger.error("推理失败，无法生成结果")
+            return 1
+        
+        # 创建可视化
+        visualizer.create_full_episode_plot(results, args.output)
+        
+        logger.info(f"完整剧集可视化已完成！结果保存到: {args.output}")
+        return 0
+        
+    except KeyboardInterrupt:
+        logger.info("用户中断了操作")
+        return 130
+    except Exception as e:
+        logger.exception(f"发生意外错误: {e}")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    import sys
+    sys.exit(main())

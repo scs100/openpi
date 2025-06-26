@@ -113,7 +113,7 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
-            image_masks=data["image_mask"],
+            image_masks=data.get("image_mask", {}),
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
