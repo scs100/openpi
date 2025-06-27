@@ -2,9 +2,16 @@
 """
 启动训练好的OpenPI模型推理服务器
 """
-
 import os
 import sys
+
+# 获取当前文件的绝对路径
+current_file = os.path.abspath(__file__)
+# 获取项目根目录（假设根目录是当前文件的父目录的父目录）
+project_root = os.path.dirname(os.path.dirname(current_file))
+# 将根目录添加到 Python 路径
+sys.path.append(project_root)
+
 import logging
 import dataclasses
 from pathlib import Path
@@ -53,7 +60,7 @@ def create_trained_model_config(config_name: str = "sgd_swap_manager"):
 
         # 数据配置 - 使用训练时的norm stats
         data=EggplantDataConfig(
-            data_path="/home/q/data/pick_and_place_eggplant/openpi",
+            data_path="/home/agilex/data/pick_and_place_eggplant/openpi",
             default_prompt="pick and place purple long eggplant",
         ),
 
