@@ -1,0 +1,28 @@
+[global_setting]
+robot_type = "agilex_v2"  # isaac, tienkung, ur, dual_ur, franka
+robot_name = "agilex1"  # pro1-5, max1, ur1, franka1
+
+[assemble]
+is_use_glove = false
+is_integrated_station = true
+is_has_hand = false
+
+[robot_ip]
+left = []
+right = []
+
+[camera_dict]
+left = []
+right = []
+front = []
+
+[home_pose]
+left =  [-0.00133514404296875, 0.00209808349609375, 0.01583099365234375, -0.032616615295410156, -0.00286102294921875, 0.00095367431640625, 0.00095367431640625]
+right = [-0.00133514404296875, 0.00438690185546875, 0.034523963928222656, -0.053597450256347656, -0.00476837158203125, -0.00209808349609375, 0.00095367431640625]
+
+[hand_type]
+left = []
+right = []
+
+[xlinker]
+[xlinker.agilex_v2]
