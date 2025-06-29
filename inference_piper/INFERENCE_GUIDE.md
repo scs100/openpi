@@ -11,8 +11,8 @@ terminal 3:
 cd ~/cobot_magic/Piper_ros_private-ros-noetic/
 bash can_multi_activate.sh
 source devel/setup.bash
-roslaunch piper start_ms_piper.launch mode:=0 auto_enable:=false
+roslaunch piper start_ms_piper.launch mode:=1 auto_enable:=True
 
 
 测试步骤：
-conda activate openpi && python inference_piper/inference_agilexv2_openpi.py 
+conda activate openpi && python /home/agilex/code/opensource/openpi/inference_piper/inference_agilexv2_openpi.py 
