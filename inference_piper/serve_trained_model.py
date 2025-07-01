@@ -14,6 +14,7 @@ sys.path.append(project_root)
 
 import logging
 import dataclasses
+import argparse
 from pathlib import Path
 
 # 设置环境变量
@@ -101,32 +102,81 @@ def create_policy(model_config: TrainedModelConfig):
     logger.info("模型加载成功!")
     return policy
 """
-python inference_piper/serve_trained_model.py  \
-     --checkpoint_dir checkpoints/sgd_swap_manager/sgd_swap_manager_norm/16000   \
-     --config_name sgd_swap_manager
+conda activate openpi &&  python inference_piper/serve_trained_model.py --checkpoint_dir checkpoints/sgd_swap_manager/sgd_swap_manager_norm/16000 --config_name sgd_swap_manager
 
 """
+
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description="启动训练好的OpenPI模型推理服务器")
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="检查点目录路径"
+    )
+    parser.add_argument(
+        "--config_name",
+        type=str,
+        default="sgd_swap_manager",
+        help="配置名称"
+    )
+    parser.add_argument(
+        "--default_prompt",
+        type=str,
+        default="pick and place purple long eggplant",
+        help="默认提示词"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="服务器端口"
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="服务器主机地址"
+    )
+    return parser.parse_args()
+
 def main():
     """主函数"""
+    # 解析命令行参数
+    args = parse_args()
+
     # 配置
     model_config = TrainedModelConfig()
-    
-    # 检查可用的检查点
-    base_dir = Path("checkpoints/sgd_swap_manager/sgd_swap_manager_norm")
-    if base_dir.exists():
-        checkpoints = [item for item in sorted(base_dir.iterdir()) 
-                      if item.is_dir() and item.name.isdigit()]
-        if checkpoints:
-            # 使用最新的检查点
-            latest_checkpoint = checkpoints[-1]
-            model_config.checkpoint_dir = str(latest_checkpoint)
-            logger.info(f"使用最新检查点: {latest_checkpoint}")
-        else:
-            logger.error("未找到有效的检查点")
-            return
+
+    # 使用命令行参数更新配置
+    if args.checkpoint_dir:
+        model_config.checkpoint_dir = args.checkpoint_dir
+        logger.info(f"使用指定的检查点: {args.checkpoint_dir}")
     else:
-        logger.error(f"检查点基础目录不存在: {base_dir}")
-        return
+        # 只有在没有指定检查点时才自动查找最新的
+        logger.info("未指定检查点，查找最新的检查点...")
+        base_dir = Path("checkpoints/sgd_swap_manager/sgd_swap_manager_norm")
+        if base_dir.exists():
+            checkpoints = [item for item in sorted(base_dir.iterdir())
+                          if item.is_dir() and item.name.isdigit()]
+            if checkpoints:
+                # 使用最新的检查点
+                latest_checkpoint = checkpoints[-1]
+                model_config.checkpoint_dir = str(latest_checkpoint)
+                logger.info(f"使用最新检查点: {latest_checkpoint}")
+            else:
+                logger.error("未找到有效的检查点")
+                return
+        else:
+            logger.error(f"检查点基础目录不存在: {base_dir}")
+            return
+
+    # 更新其他配置
+    model_config.config_name = args.config_name
+    model_config.default_prompt = args.default_prompt
+    model_config.port = args.port
+    model_config.host = args.host
     
     try:
         # 创建策略

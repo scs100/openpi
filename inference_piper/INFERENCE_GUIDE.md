@@ -14,5 +14,20 @@ source devel/setup.bash
 roslaunch piper start_ms_piper.launch mode:=1 auto_enable:=True
 
 
-测试步骤：
+terminal 4:
+
+conda activate openpi && \
+python inference_piper/serve_trained_model.py  \
+     --checkpoint_dir checkpoints/sgd_swap_manager/sgd_swap_manager_norm/16000  \
+     --config_name sgd_swap_manager
+
+
+
+terminal 5:
+conda deactivate; deactivate;\
+cd /home/agilex/code/opensource/openpi/inference_piper && \
+python simple_data_service.py
+
+terminal 6:
+
 conda activate openpi && python /home/agilex/code/opensource/openpi/inference_piper/inference_agilexv2_openpi.py 
