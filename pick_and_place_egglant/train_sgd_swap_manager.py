@@ -9,6 +9,7 @@ SGD优化器主动Swap管理训练脚本
 - 修改内存设置：调整 GPU_MEM_FRACTION, SWAP_THRESHOLD 等常量
 - 修改数据路径：调整 EGGPLANT_DATA_PATH 常量
 - 修改实验名称：调整 EXPERIMENT_NAME, WANDB_PROJECT 等常量
+- 修改训练帧率：调整 TRAINING_FPS 常量 (可选: 10, 33.3, 50, 100)
 
 所有配置都使用常量定义，便于统一管理和修改
 """
@@ -37,27 +38,25 @@ sys.path.insert(0, os.path.abspath('.'))
 # 数据配置
 EGGPLANT_DATA_PATH = "/home/testuser/data/pick_and_place_eggplant/openpi"
 DEFAULT_PROMPT = "pick and place purple long eggplant"
+# 训练帧率配置 - 可选: 10, 33.3, 50, 100
+TRAINING_FPS = 33.3  # 🎬 修改此值来切换训练帧率
 # 实验配置
-EXPERIMENT_NAME = "sgd_swap_manager_norm"
+EXPERIMENT_NAME = "sgd_0_9_decay_1e5_bat6_20000_dataload_33fps"
 WANDB_PROJECT = "openpi_eggplant_production"
+# WandB配置
+FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
 # 恢复训练配置
-RESUME_TRAINING = True          # 
-OVERWRITE_CHECKPOINT = False    #  
+RESUME_TRAINING = True           # 启用恢复训练
+OVERWRITE_CHECKPOINT = False   #  
 
-#开始 bat 4 
-# workers 1 
-# save 10
-
-#resume  bat 6 
-# workers 4 
-# save 1000
-# 训练配置
+#从头开始训练和
+ 
 BATCH_SIZE = 6             # 批量大小 (降低以减少内存压力)
-NUM_WORKERS = 4            # 工作进程数 (最佳性能稳定性平衡点)
+NUM_WORKERS = 0            # 预加载使用单进程即可
 SAVE_INTERVAL = 1000       # 保存间隔 (每1000步保存，大幅减少内存压力)
 NUM_TRAIN_STEPS = 20000     # 训练步数 (增加到20k，持续训练)
 LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
-KEEP_PERIOD = 2000          # 检查点保留周期 (每2000步的检查点永久保留)
+KEEP_PERIOD = 2000          # 检查点保留周期 (每1000步的检查点永久保留)
 
 # 学习率配置 - 动态预热步数
 WARMUP_RATIO = 0.02         # 预热比例 (2% of total steps)
@@ -65,6 +64,7 @@ PEAK_LR = 1e-4              # 峰值学习率
 DECAY_LR = 1e-5             # 最终学习率
 SGD_MOMENTUM = 0.9          # SGD动量
 SGD_NESTEROV = True         # 是否使用Nesterov
+
 
 # 模型配置
 ACTION_DIM = 32             # 动作维度（必须保持32，与预训练模型匹配）
@@ -91,7 +91,7 @@ WARMUP_STEPS = int(NUM_TRAIN_STEPS * WARMUP_RATIO) if not RESUME_TRAINING else 5
 
 # 恢复训练专用内存配置
 RESUME_GPU_MEM_FRACTION = '0.70'  # 恢复训练时使用70% (与原训练相同)
-RESUME_BATCH_SIZE = 6             # 恢复训练时使用已验证的批量大小6
+RESUME_BATCH_SIZE = BATCH_SIZE    # 恢复训练时使用已验证的批量大小6
 DYNAMIC_BATCH_ADJUSTMENT = False  # 已找到最优批量大小，禁用动态调整
 MIN_BATCH_SIZE = 1                # 最小批量大小
 
@@ -655,14 +655,44 @@ def optimize_system_memory():
     os.environ['MALLOC_TRIM_THRESHOLD_'] = '0'
     os.environ['MALLOC_MMAP_THRESHOLD_'] = '65536'
 
-    # WandB配置 - 在线模式
-    # 移除离线模式设置，使用在线模式上传数据
-    if 'WANDB_MODE' in os.environ:
-        del os.environ['WANDB_MODE']
-    os.environ['WANDB_SILENT'] = 'false'  # 显示WandB输出
+    # WandB配置 - 智能模式（在线优先，离线备用）
+    # 检测网络连接状态
+    def check_wandb_connectivity():
+        """检查WandB连接状态"""
+        try:
+            import requests
+            response = requests.get("https://api.wandb.ai/", timeout=10)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    if FORCE_WANDB_OFFLINE:
+        # 强制离线模式
+        os.environ['WANDB_MODE'] = 'offline'
+        os.environ['WANDB_SILENT'] = 'true'
+        print("🔒 强制使用WandB离线模式")
+        print("💡 训练完成后可使用 'wandb sync' 手动同步数据")
+        wandb_mode = "offline"
+    else:
+        # 智能模式：检测网络连接
+        wandb_online = check_wandb_connectivity()
+        if wandb_online:
+            # 在线模式
+            if 'WANDB_MODE' in os.environ:
+                del os.environ['WANDB_MODE']
+            os.environ['WANDB_SILENT'] = 'false'
+            print("✅ WandB网络连接正常，使用在线模式")
+            wandb_mode = "online"
+        else:
+            # 离线模式备用
+            os.environ['WANDB_MODE'] = 'offline'
+            os.environ['WANDB_SILENT'] = 'true'
+            print("⚠️ WandB网络连接失败，使用离线模式")
+            print("💡 训练完成后可使用 'wandb sync' 手动同步数据")
+            wandb_mode = "offline"
 
     print("✅ 主动Swap管理内存优化设置完成")
-    print("✅ WandB设置为在线模式")
+    print(f"✅ WandB设置为{wandb_mode}模式")
 
 # 应用内存优化
 force_gpu_memory_reset()  # 恢复训练前强制重置GPU
@@ -670,41 +700,78 @@ optimize_system_memory()
 
 from scripts.train import main
 
+# 创建安全的训练函数，替换原始的WandB初始化
+def safe_main(config):
+    """安全的训练主函数，使用容错的WandB初始化"""
+    # 导入必要的模块
+    import scripts.train as train_module
+
+    # 保存原始的init_wandb函数
+    original_init_wandb = train_module.init_wandb
+
+    # 替换为我们的安全版本
+    def safe_init_wandb_wrapper(config, *, resuming=False, log_code=False, enabled=True):
+        success, mode = safe_wandb_init(config, resuming=resuming)
+        if success:
+            print(f"✅ WandB初始化成功 (模式: {mode})")
+        else:
+            print("⚠️ WandB初始化失败，但训练将继续")
+        return success
+
+    try:
+        # 临时替换init_wandb函数
+        train_module.init_wandb = safe_init_wandb_wrapper
+
+        # 调用原始的main函数
+        return main(config)
+
+    finally:
+        # 恢复原始函数
+        train_module.init_wandb = original_init_wandb
+
 # 应用内存优化数据加载器补丁
 def patch_memory_optimized_data_loader():
-    """补丁OpenPI数据加载器使用内存优化版本"""
+    """补丁OpenPI数据加载器使用快速版本"""
     from openpi.training import data_loader as _data_loader
     from openpi.training import config as _config
     from openpi.models import model as _model
-    from memory_optimized_dataset import MemoryOptimizedEggplantDataset
-    
+    from fast_eggplant_dataset import FastEggplantDataset
+
     # 保存原始函数
     original_create_dataset = _data_loader.create_dataset
-    
-    def memory_optimized_create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig):
-        """内存优化版本的create_dataset"""
+
+    def fast_create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig):
+        """快速版本的create_dataset"""
         repo_id = data_config.repo_id
-        
+
         if repo_id is None:
             raise ValueError("Repo ID is not set. Cannot create dataset.")
-        
+
         if repo_id == "fake":
             return _data_loader.FakeDataset(model_config, num_samples=1024)
-        
-        # 使用内存优化的茄子数据集
+
+        # 使用快速茄子数据集
         if repo_id == "eggplant_real_data":
-            print("🚀 使用内存优化茄子数据集!")
-            return MemoryOptimizedEggplantDataset(
+            print("🚀 使用快速茄子数据集!")
+            print(f"🎬 训练配置: 原始100fps → 训练{TRAINING_FPS}fps (基于时间戳采样)")
+
+            # 计算时间跨度信息
+            time_span = 50 / TRAINING_FPS
+            print(f"⏰ 50步动作序列时间跨度: {time_span:.2f}秒")
+
+            return FastEggplantDataset(
                 data_path=EGGPLANT_DATA_PATH,
-                default_prompt=DEFAULT_PROMPT
+                default_prompt=DEFAULT_PROMPT,
+                training_fps=TRAINING_FPS,  # 使用配置的训练fps
+                preload_episodes=None  # 自动加载所有parquet文件
             )
-        
+
         # 其他情况使用原始函数
         return original_create_dataset(data_config, model_config)
-    
+
     # 替换函数
-    _data_loader.create_dataset = memory_optimized_create_dataset
-    print("✅ 已应用内存优化数据加载器补丁")
+    _data_loader.create_dataset = fast_create_dataset
+    print("✅ 已应用快速数据加载器补丁")
 
 patch_memory_optimized_data_loader()
 
@@ -877,6 +944,81 @@ def log_system_memory(logger, step_name=""):
 
 
 
+def safe_wandb_init(config, resuming=False):
+    """安全的WandB初始化，支持网络故障容错"""
+    try:
+        import wandb
+        import dataclasses
+
+        if not config.wandb_enabled:
+            wandb.init(mode="disabled")
+            return True, "disabled"
+
+        # 检测网络连接
+        def check_wandb_connectivity():
+            try:
+                import requests
+                response = requests.get("https://api.wandb.ai/", timeout=10)
+                return response.status_code == 200
+            except Exception:
+                return False
+
+        # 检查是否强制离线模式
+        if FORCE_WANDB_OFFLINE:
+            print("🔒 强制使用WandB离线模式...")
+        # 尝试在线模式
+        elif check_wandb_connectivity():
+            try:
+                if resuming:
+                    ckpt_dir = config.checkpoint_dir
+                    if ckpt_dir.exists() and (ckpt_dir / "wandb_id.txt").exists():
+                        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+                        wandb.init(id=run_id, resume="must", project=config.project_name)
+                    else:
+                        # 恢复训练但没有wandb_id，创建新的run
+                        wandb.init(
+                            name=config.exp_name,
+                            config=dataclasses.asdict(config),
+                            project=config.project_name,
+                        )
+                        if ckpt_dir.exists():
+                            (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+                else:
+                    wandb.init(
+                        name=config.exp_name,
+                        config=dataclasses.asdict(config),
+                        project=config.project_name,
+                    )
+                    ckpt_dir = config.checkpoint_dir
+                    if ckpt_dir.exists():
+                        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+
+                return True, "online"
+            except Exception as e:
+                print(f"⚠️ WandB在线模式初始化失败: {e}")
+                # 降级到离线模式
+                pass
+
+        # 离线模式备用
+        print("🔄 使用WandB离线模式...")
+        os.environ['WANDB_MODE'] = 'offline'
+        wandb.init(
+            name=config.exp_name,
+            config=dataclasses.asdict(config),
+            project=config.project_name,
+        )
+        return True, "offline"
+
+    except Exception as e:
+        print(f"❌ WandB初始化完全失败: {e}")
+        print("🚫 禁用WandB，继续训练...")
+        try:
+            import wandb
+            wandb.init(mode="disabled")
+        except:
+            pass
+        return False, "failed"
+
 def create_dynamic_training_config(initial_batch_size):
     """创建动态训练配置，支持OOM时自动降低批量大小"""
     import openpi.training.config as _config
@@ -988,7 +1130,7 @@ def train_with_dynamic_batch_size(capture_logger, swap_manager):
             import openpi.shared.array_typing as at
             with at.disable_typechecking():
                 capture_logger.info("🎯 开始训练...")
-                main(config)
+                safe_main(config)
 
             capture_logger.info("✅ 训练成功完成!")
             return True, current_batch_size
@@ -1168,7 +1310,7 @@ if __name__ == "__main__":
                 import openpi.shared.array_typing as at
                 with at.disable_typechecking():
                     capture_logger.info("🎯 开始训练...")
-                    main(config)
+                    safe_main(config)
 
                 capture_logger.info("✅ 训练成功完成!")
 
