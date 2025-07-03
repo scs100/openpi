@@ -48,11 +48,16 @@ WANDB_PROJECT = "lora_eggplant"  # 修改为您的WandB项目名
 FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
 # 恢复训练配置
 RESUME_TRAINING = False           # 启用恢复训练
-OVERWRITE_CHECKPOINT = True   #  
+OVERWRITE_CHECKPOINT = True   #
 
-#从头开始训练和
- 
-BATCH_SIZE = 6             # 批量大小 (降低以减少内存压力)
+# 优化器选择配置
+USE_ADAMW = False           # True: 使用AdamW, False: 使用SGD
+
+# 批量大小配置 - 根据优化器动态调整
+SGD_BATCH_SIZE = 6          # SGD批量大小 (已验证在RTX 4090上稳定)
+ADAMW_BATCH_SIZE = 4        # AdamW批量大小 (为额外内存需求预留空间)
+BATCH_SIZE = ADAMW_BATCH_SIZE if USE_ADAMW else SGD_BATCH_SIZE
+
 NUM_WORKERS = 0            # 预加载使用单进程即可
 SAVE_INTERVAL = 1000       # 保存间隔 (每1000步保存，大幅减少内存压力)
 NUM_TRAIN_STEPS = 40000     # 训练步数 (增加到20k，持续训练)
@@ -61,10 +66,25 @@ KEEP_PERIOD = 2000          # 检查点保留周期 (每1000步的检查点永�
 
 # 学习率配置 - 动态预热步数
 WARMUP_RATIO = 0.02         # 预热比例 (2% of total steps)
-PEAK_LR = 1e-4              # 峰值学习率
-DECAY_LR = 1e-5             # 最终学习率
+
+# SGD配置
+SGD_PEAK_LR = 1e-4          # SGD峰值学习率
+SGD_DECAY_LR = 1e-5         # SGD最终学习率
 SGD_MOMENTUM = 0.9          # SGD动量
 SGD_NESTEROV = True         # 是否使用Nesterov
+
+# AdamW配置
+ADAMW_PEAK_LR = 5e-5        # AdamW峰值学习率 (比SGD低)
+ADAMW_DECAY_LR = 5e-6       # AdamW最终学习率
+ADAMW_B1 = 0.9              # AdamW一阶矩衰减率
+ADAMW_B2 = 0.95             # AdamW二阶矩衰减率
+ADAMW_EPS = 1e-8            # AdamW数值稳定性
+ADAMW_WEIGHT_DECAY = 1e-10  # AdamW权重衰减
+ADAMW_CLIP_NORM = 1.0       # AdamW梯度裁剪
+
+# 动态配置 - 根据优化器选择
+PEAK_LR = ADAMW_PEAK_LR if USE_ADAMW else SGD_PEAK_LR
+DECAY_LR = ADAMW_DECAY_LR if USE_ADAMW else SGD_DECAY_LR
 
 
 # 模型配置
@@ -74,8 +94,10 @@ MAX_TOKEN_LEN = 48          # 最大token长度
 PALIGEMMA_VARIANT = "gemma_2b_lora"
 ACTION_EXPERT_VARIANT = "gemma_300m_lora"
 
-# 内存管理配置
-GPU_MEM_FRACTION = '0.70'   # GPU内存分配比例
+# 内存管理配置 - 根据优化器动态调整
+SGD_GPU_MEM_FRACTION = '0.70'    # SGD GPU内存分配比例
+ADAMW_GPU_MEM_FRACTION = '0.65'  # AdamW GPU内存分配比例 (更保守)
+GPU_MEM_FRACTION = ADAMW_GPU_MEM_FRACTION if USE_ADAMW else SGD_GPU_MEM_FRACTION
 # 分阶段Swap管理阈值 - 优化版
 SWAP_WARNING_THRESHOLD = 30    # 警告阈值 - 开始轻度清理
 SWAP_ACTION_THRESHOLD = 50     # 行动阈值 - 中度清理
@@ -91,8 +113,8 @@ CHECKPOINT_PATH = "s3://openpi-assets/checkpoints/pi0_base/params"
 WARMUP_STEPS = int(NUM_TRAIN_STEPS * WARMUP_RATIO) if not RESUME_TRAINING else 50  # 恢复训练时短预热
 
 # 恢复训练专用内存配置
-RESUME_GPU_MEM_FRACTION = '0.70'  # 恢复训练时使用70% (与原训练相同)
-RESUME_BATCH_SIZE = BATCH_SIZE    # 恢复训练时使用已验证的批量大小6
+RESUME_GPU_MEM_FRACTION = GPU_MEM_FRACTION  # 恢复训练时使用与当前优化器匹配的内存配置
+RESUME_BATCH_SIZE = BATCH_SIZE    # 恢复训练时使用已验证的批量大小
 DYNAMIC_BATCH_ADJUSTMENT = False  # 已找到最优批量大小，禁用动态调整
 MIN_BATCH_SIZE = 1                # 最小批量大小
 
@@ -905,7 +927,8 @@ def setup_logging():
     from log_utils import setup_test_logger
 
     # 创建日志文件和日志器
-    logger, log_file = setup_test_logger("sgd_swap_manager", "logs")
+    optimizer_name = "adamw" if USE_ADAMW else "sgd"
+    logger, log_file = setup_test_logger(f"{optimizer_name}_swap_manager", "logs")
 
     return logger, log_file
 
@@ -1065,8 +1088,14 @@ def create_dynamic_training_config(initial_batch_size):
             decay_lr=DECAY_LR,
         ),
 
-        # SGD优化器 - 使用常量定义
-        optimizer=_optimizer.SGD(
+        # 优化器 - 根据配置选择SGD或AdamW
+        optimizer=_optimizer.AdamW(
+            b1=ADAMW_B1,
+            b2=ADAMW_B2,
+            eps=ADAMW_EPS,
+            weight_decay=ADAMW_WEIGHT_DECAY,
+            clip_gradient_norm=ADAMW_CLIP_NORM,
+        ) if USE_ADAMW else _optimizer.SGD(
             momentum=SGD_MOMENTUM,
             nesterov=SGD_NESTEROV,
         ),
@@ -1208,8 +1237,14 @@ def create_swap_managed_config():
             decay_lr=DECAY_LR,
         ),
 
-        # SGD优化器 - 使用常量定义
-        optimizer=_optimizer.SGD(
+        # 优化器 - 根据配置选择SGD或AdamW
+        optimizer=_optimizer.AdamW(
+            b1=ADAMW_B1,
+            b2=ADAMW_B2,
+            eps=ADAMW_EPS,
+            weight_decay=ADAMW_WEIGHT_DECAY,
+            clip_gradient_norm=ADAMW_CLIP_NORM,
+        ) if USE_ADAMW else _optimizer.SGD(
             momentum=SGD_MOMENTUM,
             nesterov=SGD_NESTEROV,
         ),
@@ -1239,10 +1274,12 @@ if __name__ == "__main__":
     # 设置基础日志
     logger, log_file = setup_logging()
 
-    print("🚀 SGD主动Swap管理训练 - 20K步正式训练")
+    optimizer_name = "AdamW" if USE_ADAMW else "SGD"
+    print(f"🚀 {optimizer_name}主动Swap管理训练 - 20K步正式训练")
     print("=" * 60)
     print("🎯 目标: 20000步持续训练，每2000步保存权重")
     print("💡 策略: 实时监控 + 主动清理 + WandB在线记录 + Terminal输出捕获")
+    print(f"⚙️ 优化器: {optimizer_name} (批量大小: {BATCH_SIZE}, GPU内存: {GPU_MEM_FRACTION})")
     print(f"📝 日志文件: {log_file}")
     print(f"🔄 恢复训练: {'启用' if RESUME_TRAINING else '禁用'}")
     print(f"📁 覆盖检查点: {'是' if OVERWRITE_CHECKPOINT else '否'}")
@@ -1251,7 +1288,7 @@ if __name__ == "__main__":
     # 使用TerminalOutputCapture捕获所有输出
     from log_utils import TerminalOutputCapture
 
-    with TerminalOutputCapture(log_file, "sgd_20k_training") as capture_logger:
+    with TerminalOutputCapture(log_file, f"{optimizer_name}_20k_training") as capture_logger:
         capture_logger.info("🔍 开始捕获所有terminal输出到日志文件")
 
         # 创建Swap管理器
