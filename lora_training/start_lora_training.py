@@ -42,13 +42,13 @@ DEFAULT_PROMPT = "pick then long eggplant and place on the plant" # 修改为您
 # 训练帧率配置 - 已废弃，现在使用数据集原始时间序列
 TRAINING_FPS = 33.3  # ⚠️ 此参数已不再使用，帧率在数据预处理时确定
 # 实验配置
-EXPERIMENT_NAME = "lora_training"  # 修改为您的实验名称
+EXPERIMENT_NAME = "rgb_lora_sgd_lr1e-4"  # 修改为您的实验名称
 WANDB_PROJECT = "lora_eggplant"  # 修改为您的WandB项目名
 # WandB配置
 FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
 # 恢复训练配置
-RESUME_TRAINING = False           # 启用恢复训练
-OVERWRITE_CHECKPOINT = True   #
+RESUME_TRAINING = True           # 启用恢复训练
+OVERWRITE_CHECKPOINT = False   #
 
 # 优化器选择配置
 USE_ADAMW = False           # True: 使用AdamW, False: 使用SGD
@@ -1288,7 +1288,7 @@ if __name__ == "__main__":
     # 使用TerminalOutputCapture捕获所有输出
     from log_utils import TerminalOutputCapture
 
-    with TerminalOutputCapture(log_file, f"{optimizer_name}_20k_training") as capture_logger:
+    with TerminalOutputCapture(log_file, "sgd_20k_training") as capture_logger:
         capture_logger.info("🔍 开始捕获所有terminal输出到日志文件")
 
         # 创建Swap管理器

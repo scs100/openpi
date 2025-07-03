@@ -103,12 +103,12 @@ class FixedDataset:
             if img is None:
                 return np.zeros((224, 224, 3), dtype=np.float32)
 
-            # BGR -> RGB 转换
+            # cv2.imdecode总是输出BGR格式，转换为RGB格式
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
             # 调整大小到224x224
             img = cv2.resize(img, (224, 224))
-            
+          
             # 归一化到[-1, 1]
             img_array = img.astype(np.float32) / 255.0
             img_array = img_array * 2.0 - 1.0
