@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-SGD优化器主动Swap管理训练脚本
-专门解决真实数据训练时swap内存溢出问题 - 主动管理版本
+OpenPI LoRA 训练脚本 - 主动内存管理版本
+支持任意 LeRobot 格式数据集的 LoRA 微调训练
 
 配置修改说明：
 - 修改训练参数：调整 BATCH_SIZE, NUM_TRAIN_STEPS 等常量
 - 修改学习率：调整 PEAK_LR, DECAY_LR, WARMUP_STEPS 等常量
 - 修改内存设置：调整 GPU_MEM_FRACTION, SWAP_THRESHOLD 等常量
-- 修改数据路径：调整 EGGPLANT_DATA_PATH 常量
+- 修改数据路径：调整 DATASET_PATH 常量
 - 修改实验名称：调整 EXPERIMENT_NAME, WANDB_PROJECT 等常量
-- 修改训练帧率：调整 TRAINING_FPS 常量 (可选: 10, 33.3, 50, 100)
+- 修改训练帧率：在数据预处理阶段完成，不在训练时采样
 
 所有配置都使用常量定义，便于统一管理和修改
 """
@@ -36,34 +36,55 @@ sys.path.insert(0, os.path.abspath('.'))
 
 # 配置常量定义
 # 数据配置
-EGGPLANT_DATA_PATH = "/home/testuser/data/pick_and_place_eggplant/openpi"
-DEFAULT_PROMPT = "pick and place purple long eggplant"
-# 训练帧率配置 - 可选: 10, 33.3, 50, 100
-TRAINING_FPS = 33.3  # 🎬 修改此值来切换训练帧率
+DATASET_PATH = "/home/testuser/data/pick_and_place_eggplant/openpi_33fps"  # 修改为您的数据集路径
+DATASET_NAME = "pick_and_place_eggplant_33fps"  # 修改为您的数据集名称
+DEFAULT_PROMPT = "pick then long eggplant and place on the plant" # 修改为您的任务描述
+# 训练帧率配置 - 已废弃，现在使用数据集原始时间序列
+TRAINING_FPS = 33.3  # ⚠️ 此参数已不再使用，帧率在数据预处理时确定
 # 实验配置
-EXPERIMENT_NAME = "sgd_0_9_decay_1e5_bat6_20000_dataload_33fps"
-WANDB_PROJECT = "openpi_eggplant_production"
+EXPERIMENT_NAME = "rgb_lora_sgd_lr1e-4"  # 修改为您的实验名称
+WANDB_PROJECT = "lora_eggplant"  # 修改为您的WandB项目名
 # WandB配置
 FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
 # 恢复训练配置
 RESUME_TRAINING = True           # 启用恢复训练
-OVERWRITE_CHECKPOINT = False   #  
+OVERWRITE_CHECKPOINT = False   #
 
-#从头开始训练和
- 
-BATCH_SIZE = 6             # 批量大小 (降低以减少内存压力)
+# 优化器选择配置
+USE_ADAMW = False           # True: 使用AdamW, False: 使用SGD
+
+# 批量大小配置 - 根据优化器动态调整
+SGD_BATCH_SIZE = 6          # SGD批量大小 (已验证在RTX 4090上稳定)
+ADAMW_BATCH_SIZE = 4        # AdamW批量大小 (为额外内存需求预留空间)
+BATCH_SIZE = ADAMW_BATCH_SIZE if USE_ADAMW else SGD_BATCH_SIZE
+
 NUM_WORKERS = 0            # 预加载使用单进程即可
 SAVE_INTERVAL = 1000       # 保存间隔 (每1000步保存，大幅减少内存压力)
-NUM_TRAIN_STEPS = 20000     # 训练步数 (增加到20k，持续训练)
+NUM_TRAIN_STEPS = 40000     # 训练步数 (增加到20k，持续训练)
 LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
 KEEP_PERIOD = 2000          # 检查点保留周期 (每1000步的检查点永久保留)
 
 # 学习率配置 - 动态预热步数
 WARMUP_RATIO = 0.02         # 预热比例 (2% of total steps)
-PEAK_LR = 1e-4              # 峰值学习率
-DECAY_LR = 1e-5             # 最终学习率
+
+# SGD配置
+SGD_PEAK_LR = 1e-4          # SGD峰值学习率
+SGD_DECAY_LR = 1e-5         # SGD最终学习率
 SGD_MOMENTUM = 0.9          # SGD动量
 SGD_NESTEROV = True         # 是否使用Nesterov
+
+# AdamW配置
+ADAMW_PEAK_LR = 5e-5        # AdamW峰值学习率 (比SGD低)
+ADAMW_DECAY_LR = 5e-6       # AdamW最终学习率
+ADAMW_B1 = 0.9              # AdamW一阶矩衰减率
+ADAMW_B2 = 0.95             # AdamW二阶矩衰减率
+ADAMW_EPS = 1e-8            # AdamW数值稳定性
+ADAMW_WEIGHT_DECAY = 1e-10  # AdamW权重衰减
+ADAMW_CLIP_NORM = 1.0       # AdamW梯度裁剪
+
+# 动态配置 - 根据优化器选择
+PEAK_LR = ADAMW_PEAK_LR if USE_ADAMW else SGD_PEAK_LR
+DECAY_LR = ADAMW_DECAY_LR if USE_ADAMW else SGD_DECAY_LR
 
 
 # 模型配置
@@ -73,8 +94,10 @@ MAX_TOKEN_LEN = 48          # 最大token长度
 PALIGEMMA_VARIANT = "gemma_2b_lora"
 ACTION_EXPERT_VARIANT = "gemma_300m_lora"
 
-# 内存管理配置
-GPU_MEM_FRACTION = '0.70'   # GPU内存分配比例
+# 内存管理配置 - 根据优化器动态调整
+SGD_GPU_MEM_FRACTION = '0.70'    # SGD GPU内存分配比例
+ADAMW_GPU_MEM_FRACTION = '0.65'  # AdamW GPU内存分配比例 (更保守)
+GPU_MEM_FRACTION = ADAMW_GPU_MEM_FRACTION if USE_ADAMW else SGD_GPU_MEM_FRACTION
 # 分阶段Swap管理阈值 - 优化版
 SWAP_WARNING_THRESHOLD = 30    # 警告阈值 - 开始轻度清理
 SWAP_ACTION_THRESHOLD = 50     # 行动阈值 - 中度清理
@@ -90,8 +113,8 @@ CHECKPOINT_PATH = "s3://openpi-assets/checkpoints/pi0_base/params"
 WARMUP_STEPS = int(NUM_TRAIN_STEPS * WARMUP_RATIO) if not RESUME_TRAINING else 50  # 恢复训练时短预热
 
 # 恢复训练专用内存配置
-RESUME_GPU_MEM_FRACTION = '0.70'  # 恢复训练时使用70% (与原训练相同)
-RESUME_BATCH_SIZE = BATCH_SIZE    # 恢复训练时使用已验证的批量大小6
+RESUME_GPU_MEM_FRACTION = GPU_MEM_FRACTION  # 恢复训练时使用与当前优化器匹配的内存配置
+RESUME_BATCH_SIZE = BATCH_SIZE    # 恢复训练时使用已验证的批量大小
 DYNAMIC_BATCH_ADJUSTMENT = False  # 已找到最优批量大小，禁用动态调整
 MIN_BATCH_SIZE = 1                # 最小批量大小
 
@@ -731,17 +754,17 @@ def safe_main(config):
 
 # 应用内存优化数据加载器补丁
 def patch_memory_optimized_data_loader():
-    """补丁OpenPI数据加载器使用快速版本"""
+    """补丁OpenPI数据加载器使用修复版本"""
     from openpi.training import data_loader as _data_loader
     from openpi.training import config as _config
     from openpi.models import model as _model
-    from fast_eggplant_dataset import FastEggplantDataset
+    from fixed_dataset import FixedDataset
 
     # 保存原始函数
     original_create_dataset = _data_loader.create_dataset
 
-    def fast_create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig):
-        """快速版本的create_dataset"""
+    def fixed_create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig):
+        """修复版本的create_dataset"""
         repo_id = data_config.repo_id
 
         if repo_id is None:
@@ -750,19 +773,17 @@ def patch_memory_optimized_data_loader():
         if repo_id == "fake":
             return _data_loader.FakeDataset(model_config, num_samples=1024)
 
-        # 使用快速茄子数据集
-        if repo_id == "eggplant_real_data":
-            print("🚀 使用快速茄子数据集!")
-            print(f"🎬 训练配置: 原始100fps → 训练{TRAINING_FPS}fps (基于时间戳采样)")
+        # 使用修复版数据集
+        if repo_id == "custom_real_data":
+            print("🚀 使用修复版数据集!")
+            print(f"🎬 训练配置: 使用原始时间序列，不进行帧率采样")
 
-            # 计算时间跨度信息
-            time_span = 50 / TRAINING_FPS
-            print(f"⏰ 50步动作序列时间跨度: {time_span:.2f}秒")
+            # 计算时间跨度信息（基于数据集原始fps）
+            print(f"⏰ 50步动作序列为连续50帧")
 
-            return FastEggplantDataset(
-                data_path=EGGPLANT_DATA_PATH,
+            return FixedDataset(
+                data_path=DATASET_PATH,
                 default_prompt=DEFAULT_PROMPT,
-                training_fps=TRAINING_FPS,  # 使用配置的训练fps
                 preload_episodes=None  # 自动加载所有parquet文件
             )
 
@@ -770,8 +791,8 @@ def patch_memory_optimized_data_loader():
         return original_create_dataset(data_config, model_config)
 
     # 替换函数
-    _data_loader.create_dataset = fast_create_dataset
-    print("✅ 已应用快速数据加载器补丁")
+    _data_loader.create_dataset = fixed_create_dataset
+    print("✅ 已应用修复版数据加载器补丁")
 
 patch_memory_optimized_data_loader()
 
@@ -906,7 +927,8 @@ def setup_logging():
     from log_utils import setup_test_logger
 
     # 创建日志文件和日志器
-    logger, log_file = setup_test_logger("sgd_swap_manager", "logs")
+    optimizer_name = "adamw" if USE_ADAMW else "sgd"
+    logger, log_file = setup_test_logger(f"{optimizer_name}_swap_manager", "logs")
 
     return logger, log_file
 
@@ -1024,10 +1046,11 @@ def create_dynamic_training_config(initial_batch_size):
     import openpi.training.config as _config
     from openpi.models import pi0
     from openpi.training import optimizer as _optimizer
-    from eggplant_train_config import EggplantDataConfig, CheckpointWeightLoader
+    from openpi.training.weight_loaders import CheckpointWeightLoader
+    from lora_train_config import CustomDataConfig
 
     config = _config.TrainConfig(
-        name="sgd_swap_manager",
+        name="lora_training",
         project_name=WANDB_PROJECT,
 
         # 模型配置 - 使用常量定义
@@ -1040,9 +1063,10 @@ def create_dynamic_training_config(initial_batch_size):
         ),
 
         # 数据配置 - 使用常量定义
-        data=EggplantDataConfig(
-            data_path=EGGPLANT_DATA_PATH,
-            default_prompt=DEFAULT_PROMPT
+        data=CustomDataConfig(
+            data_path=DATASET_PATH,
+            default_prompt=DEFAULT_PROMPT,
+            dataset_name=DATASET_NAME
         ),
 
         # 权重加载器 - 使用常量定义
@@ -1064,8 +1088,14 @@ def create_dynamic_training_config(initial_batch_size):
             decay_lr=DECAY_LR,
         ),
 
-        # SGD优化器 - 使用常量定义
-        optimizer=_optimizer.SGD(
+        # 优化器 - 根据配置选择SGD或AdamW
+        optimizer=_optimizer.AdamW(
+            b1=ADAMW_B1,
+            b2=ADAMW_B2,
+            eps=ADAMW_EPS,
+            weight_decay=ADAMW_WEIGHT_DECAY,
+            clip_gradient_norm=ADAMW_CLIP_NORM,
+        ) if USE_ADAMW else _optimizer.SGD(
             momentum=SGD_MOMENTUM,
             nesterov=SGD_NESTEROV,
         ),
@@ -1165,10 +1195,11 @@ def create_swap_managed_config():
     import openpi.training.config as _config
     from openpi.models import pi0
     from openpi.training import optimizer as _optimizer
-    from eggplant_train_config import EggplantDataConfig, CheckpointWeightLoader
-    
+    from openpi.training.weight_loaders import CheckpointWeightLoader
+    from lora_train_config import CustomDataConfig
+
     config = _config.TrainConfig(
-        name="sgd_swap_manager",
+        name="lora_training",
         project_name=WANDB_PROJECT,
 
         # 模型配置 - 使用常量定义
@@ -1181,9 +1212,10 @@ def create_swap_managed_config():
         ),
 
         # 数据配置 - 使用常量定义
-        data=EggplantDataConfig(
-            data_path=EGGPLANT_DATA_PATH,
-            default_prompt=DEFAULT_PROMPT
+        data=CustomDataConfig(
+            data_path=DATASET_PATH,
+            default_prompt=DEFAULT_PROMPT,
+            dataset_name=DATASET_NAME
         ),
 
         # 权重加载器 - 使用常量定义
@@ -1205,8 +1237,14 @@ def create_swap_managed_config():
             decay_lr=DECAY_LR,
         ),
 
-        # SGD优化器 - 使用常量定义
-        optimizer=_optimizer.SGD(
+        # 优化器 - 根据配置选择SGD或AdamW
+        optimizer=_optimizer.AdamW(
+            b1=ADAMW_B1,
+            b2=ADAMW_B2,
+            eps=ADAMW_EPS,
+            weight_decay=ADAMW_WEIGHT_DECAY,
+            clip_gradient_norm=ADAMW_CLIP_NORM,
+        ) if USE_ADAMW else _optimizer.SGD(
             momentum=SGD_MOMENTUM,
             nesterov=SGD_NESTEROV,
         ),
@@ -1229,17 +1267,19 @@ def create_swap_managed_config():
         resume=RESUME_TRAINING,
         wandb_enabled=True,
     )
-    
+
     return config
 
 if __name__ == "__main__":
     # 设置基础日志
     logger, log_file = setup_logging()
 
-    print("🚀 SGD主动Swap管理训练 - 20K步正式训练")
+    optimizer_name = "AdamW" if USE_ADAMW else "SGD"
+    print(f"🚀 {optimizer_name}主动Swap管理训练 - 20K步正式训练")
     print("=" * 60)
     print("🎯 目标: 20000步持续训练，每2000步保存权重")
     print("💡 策略: 实时监控 + 主动清理 + WandB在线记录 + Terminal输出捕获")
+    print(f"⚙️ 优化器: {optimizer_name} (批量大小: {BATCH_SIZE}, GPU内存: {GPU_MEM_FRACTION})")
     print(f"📝 日志文件: {log_file}")
     print(f"🔄 恢复训练: {'启用' if RESUME_TRAINING else '禁用'}")
     print(f"📁 覆盖检查点: {'是' if OVERWRITE_CHECKPOINT else '否'}")
