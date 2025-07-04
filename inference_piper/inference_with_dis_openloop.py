@@ -70,13 +70,40 @@ class FullEpisodeInferenceVisualizer:
             logger.error(f"Connection failed: {e}")
             return False
     
-    def load_gt_data(self, max_episodes=3):
+    def load_gt_data(self, target_episode=None, max_episodes=3):
         """Load ground truth data"""
         parquet_files = list(self.data_path.glob("data/chunk-*/episode_*.parquet"))
         if not parquet_files:
-            return False
-            
-        parquet_files = sorted(parquet_files)[:max_episodes]
+            # 尝试直接在数据路径下查找
+            parquet_files = list(self.data_path.glob("episode_*.parquet"))
+            if not parquet_files:
+                return False
+
+        parquet_files = sorted(parquet_files)
+
+        # 如果指定了目标episode，只加载该episode
+        if target_episode is not None:
+            target_file = None
+            for file_path in parquet_files:
+                # 从文件名提取episode编号
+                filename = file_path.name
+                if filename.startswith('episode_') and filename.endswith('.parquet'):
+                    try:
+                        episode_num = int(filename.split('_')[1].split('.')[0])
+                        if episode_num == target_episode:
+                            target_file = file_path
+                            break
+                    except (ValueError, IndexError):
+                        continue
+
+            if target_file is None:
+                logger.error(f"找不到episode {target_episode}的parquet文件")
+                logger.info(f"可用的episode文件: {[f.name for f in parquet_files[:10]]}")  # 显示前10个
+                return False
+
+            parquet_files = [target_file]
+        else:
+            parquet_files = parquet_files[:max_episodes]
         all_data = []
         
         for file_path in parquet_files:
@@ -610,13 +637,13 @@ python inference_piper/inference_with_dis_openloop.py \
             logger.error("无法连接到推理服务器，请确保服务器正在运行")
             return 1
         # 加载数据
-        if not visualizer.load_gt_data():
+        if not visualizer.load_gt_data(target_episode=args.episode):
             logger.error("无法加载地面真值数据，请检查数据路径")
             return 1
         logger.info(f"开始为剧集 {args.episode} 进行完整分析...")
-        # 运行完整剧集推理
+        # 运行完整剧集推理（现在只加载了目标episode，所以索引是0）
         results = visualizer.run_full_episode_inference(
-            episode_idx=args.episode, 
+            episode_idx=0,
             step_limit=step_limit,
             max_consecutive_errors=args.max_errors,
             future_steps=args.future_steps
