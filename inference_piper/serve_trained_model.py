@@ -14,7 +14,6 @@ sys.path.append(project_root)
 
 import logging
 import dataclasses
-from pathlib import Path
 
 # 设置环境变量
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.7'
@@ -34,13 +33,13 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass
 class TrainedModelConfig:
     """训练模型配置"""
-    checkpoint_dir: str = "checkpoints/sgd_swap_manager/sgd_swap_manager_norm/16000"
-    config_name: str = "sgd_swap_manager"
-    default_prompt: str = "pick and place purple long eggplant"
+    checkpoint_dir: str = "checkpoints/lora_training/rgb_lora_sgd_lr1e-4/16000"
+    config_name: str = "lora_training"
+    default_prompt: str = "pick then long eggplant and place on the plant"
     port: int = 8000
     host: str = "0.0.0.0"
 
-def create_trained_model_config(config_name: str = "sgd_swap_manager"):
+def create_trained_model_config(config_name: str = "lora_training"):
     """创建与训练时相同的模型配置"""
     # 导入数据配置
     from pick_and_place_egglant.eggplant_train_config import EggplantDataConfig
@@ -57,11 +56,11 @@ def create_trained_model_config(config_name: str = "sgd_swap_manager"):
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora"
         ),
-
+        
         # 数据配置 - 使用训练时的norm stats
         data=EggplantDataConfig(
-            data_path="/home/agilex/data/pick_and_place_eggplant/openpi",
-            default_prompt="pick and place purple long eggplant",
+            data_path="/home/testuser/data/pick_and_place_eggplant/openpi_33fps",
+            default_prompt="pick then long eggplant and place on the plant",
         ),
 
         # 权重加载器
@@ -73,61 +72,57 @@ def create_policy(model_config: TrainedModelConfig):
     """创建训练好的策略"""
     logger.info(f"正在加载训练好的模型...")
     logger.info(f"检查点目录: {model_config.checkpoint_dir}")
-    
-    # 检查检查点是否存在
-    checkpoint_path = Path(model_config.checkpoint_dir)
-    if not checkpoint_path.exists():
-        logger.error(f"检查点目录不存在: {model_config.checkpoint_dir}")
-        
-        # 列出可用的检查点
-        base_dir = Path("checkpoints/sgd_swap_manager/sgd_swap_manager_norm")
-        if base_dir.exists():
-            logger.info("可用的检查点:")
-            for item in sorted(base_dir.iterdir()):
-                if item.is_dir() and item.name.isdigit():
-                    logger.info(f"  - {item}")
-        raise FileNotFoundError(f"检查点目录不存在: {model_config.checkpoint_dir}")
-    
+
     # 创建配置
     config = create_trained_model_config(model_config.config_name)
-    
+
     # 创建训练好的策略
     policy = _policy_config.create_trained_policy(
-        config, 
+        config,
         model_config.checkpoint_dir,
         default_prompt=model_config.default_prompt
     )
-    
+
     logger.info("模型加载成功!")
     return policy
 """
-python inference_piper/serve_trained_model.py  \
-     --checkpoint_dir checkpoints/sgd_swap_manager/sgd_swap_manager_norm/16000   \
-     --config_name sgd_swap_manager
-
+使用示例:
+python inference_piper/serve_trained_model.py \
+     --checkpoint_dir checkpoints/lora_training/rgb_lora_sgd_lr1e-4/39999 \
+     --config_name lora_training \
+     --default_prompt "pick then long eggplant and place on the plant" \
+     --port 8000 \
+     --host 0.0.0.0
 """
 def main():
     """主函数"""
-    # 配置
-    model_config = TrainedModelConfig()
-    
-    # 检查可用的检查点
-    base_dir = Path("checkpoints/sgd_swap_manager/sgd_swap_manager_norm")
-    if base_dir.exists():
-        checkpoints = [item for item in sorted(base_dir.iterdir()) 
-                      if item.is_dir() and item.name.isdigit()]
-        if checkpoints:
-            # 使用最新的检查点
-            latest_checkpoint = checkpoints[-1]
-            model_config.checkpoint_dir = str(latest_checkpoint)
-            logger.info(f"使用最新检查点: {latest_checkpoint}")
-        else:
-            logger.error("未找到有效的检查点")
-            return
-    else:
-        logger.error(f"检查点基础目录不存在: {base_dir}")
-        return
-    
+    import argparse
+
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="启动训练好的OpenPI模型推理服务器")
+    parser.add_argument("--checkpoint_dir",
+                        default="checkpoints/lora_training/rgb_lora_sgd_lr1e-4/16000",
+                        help="检查点目录路径")
+    parser.add_argument("--config_name",
+                        default="lora_training",
+                        help="配置名称")
+    parser.add_argument("--default_prompt",
+                        default="pick then long eggplant and place on the plant",
+                        help="默认提示词")
+    parser.add_argument("--port", type=int, default=8000, help="服务器端口")
+    parser.add_argument("--host", default="0.0.0.0", help="服务器主机地址")
+
+    args = parser.parse_args()
+
+    # 使用命令行参数创建配置
+    model_config = TrainedModelConfig(
+        checkpoint_dir=args.checkpoint_dir,
+        config_name=args.config_name,
+        default_prompt=args.default_prompt,
+        port=args.port,
+        host=args.host
+    )
+
     try:
         # 创建策略
         policy = create_policy(model_config)

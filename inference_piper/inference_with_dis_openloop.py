@@ -43,17 +43,16 @@ def decode_image(img_bytes):
 class FullEpisodeInferenceVisualizer:
     """Full episode inference visualizer"""
     
-    def __init__(self, host="localhost", port=8000, data_path="/home/q/data/pick_and_place_eggplant/openpi", debug=False):
+    def __init__(self, host="localhost", port=8000, data_path="/home/q/data/pick_and_place_eggplant/openpi", debug=False, prediction_step=0):
         self.host = host
         self.port = port
         self.data_path = Path(data_path)
         self.policy = None
         self.gt_data = None
         self.debug = debug
-        # 扰动参数初始化
-        self.image_noise = 0
-        self.state_noise = 0
-        self.random_mask = 0
+        # 统一控制选择哪一步预测进行对比和可视化
+        # 0: 第一步, -1: 最后一步, 其他: 指定步数
+        self.prediction_step = prediction_step
         # Joint names for 14-dimensional actions
         self.joint_names = [
             'Left_J1', 'Left_J2', 'Left_J3', 'Left_J4', 'Left_J5', 'Left_J6', 'Left_Gripper',
@@ -211,16 +210,7 @@ class FullEpisodeInferenceVisualizer:
                                 images[mapped_key] = decode_image(img_data)
                             else:
                                 images[mapped_key] = img_data
-                # ====== 扰动处理开始 ======
-                if self.image_noise > 0:
-                    for k in images:
-                        images[k] = self.add_image_noise(images[k], sigma=self.image_noise)
-                if self.random_mask > 0:
-                    for k in images:
-                        images[k] = self.random_image_mask(images[k], mask_ratio=self.random_mask)
-                if self.state_noise > 0:
-                    padded_state = self.add_state_noise(padded_state, sigma=self.state_noise)
-                # ====== 扰动处理结束 ======
+
                 # --- 新增详细日志 ---
                 if self.debug:
                     logger.info(f"Step {step_idx}: 输入state前5维: {padded_state[:5]}")
@@ -248,24 +238,24 @@ class FullEpisodeInferenceVisualizer:
                 # --- 新增详细日志 ---
                 if self.debug:
                     logger.info(f"Step {step_idx}: 推理返回keys: {list(result.keys())}")
-                # 获取预测的状态而不是动作
-                if "state" in result:
-                    pred_state_key = "state"
-                elif "predicted_state" in result:
-                    pred_state_key = "predicted_state"
+                # 使用动作预测而不是状态（因为state键只是返回输入状态）
+                if "actions" in result:
+                    pred_state_key = "actions"
                 elif "future_states" in result:
                     pred_state_key = "future_states"
+                elif "predicted_state" in result:
+                    pred_state_key = "predicted_state"
                 elif "states" in result:
                     pred_state_key = "states"
                 else:
-                    logger.warning("在结果中找不到状态键，尝试使用动作")
-                    pred_state_key = "actions"
+                    logger.warning("在结果中找不到动作键，尝试使用状态")
+                    pred_state_key = "state"
                 # 记录首次返回的数据结构
                 if step_idx == 0 or self.debug:
-                    logger.info(f"Step {step_idx}: 使用键 '{pred_state_key}' 获取预测状态")
+                    logger.info(f"Step {step_idx}: 使用键 '{pred_state_key}' 获取预测动作")
                     if pred_state_key in result:
                         pred_data = result[pred_state_key]
-                        logger.info(f"Step {step_idx}: 预测数据类型: {type(pred_data)}, 内容前5: {np.array(pred_data).flatten()[:5]}")
+                        logger.info(f"Step {step_idx}: 预测数据类型: {type(pred_data)}, 形状: {getattr(pred_data, 'shape', 'N/A')}, 内容前5: {np.array(pred_data).flatten()[:5]}")
                 # 获取当前和未来步骤的真实状态
                 gt_state_current = current_state
                 gt_states_future = []
@@ -291,9 +281,23 @@ class FullEpisodeInferenceVisualizer:
                 else:
                     logger.warning(f"在结果中找不到键 '{pred_state_key}'，使用持久性预测")
                     pred_states_future = [current_state] * future_steps
-                # --- 新增：如果预测和gt完全一样，打印warning ---
-                if np.allclose(np.array(pred_states_future[0])[:14], np.array(gt_states_future[0])[:14]):
-                    logger.warning(f"Step {step_idx}: 预测和GT完全一致，可能未真正推理！")
+                # --- 检查预测是否合理（动作预测应该与当前状态不同）---
+                if pred_state_key == "actions":
+                    # 对于动作预测，使用统一的prediction_step选择哪一步进行比较
+                    selected_action = np.array(pred_states_future[0])  # 这是(50,32)
+                    if len(selected_action.shape) == 2:  # 如果是(50,32)形状
+                        pred_action_14 = selected_action[self.prediction_step, :14]  # 使用统一参数选择步数
+                    else:  # 如果已经是(32,)形状
+                        pred_action_14 = selected_action[:14]
+                    current_state_14 = np.array(current_state)[:14]
+                    if np.allclose(pred_action_14, current_state_14, atol=1e-6):
+                        logger.warning(f"Step {step_idx}: 预测动作与当前状态过于相似，可能未真正推理！")
+                    else:
+                        logger.info(f"Step {step_idx}: 预测动作与当前状态差异正常，推理成功 (使用第{self.prediction_step}步预测)")
+                else:
+                    # 对于状态预测，检查是否与GT状态相同
+                    if np.allclose(np.array(pred_states_future[0])[:14], np.array(gt_states_future[0])[:14]):
+                        logger.warning(f"Step {step_idx}: 预测和GT完全一致，可能未真正推理！")
                 # 存储结果
                 gt_states.append(gt_states_future)
                 pred_states.append(pred_states_future)
@@ -354,8 +358,17 @@ class FullEpisodeInferenceVisualizer:
     def create_full_episode_plot(self, results, save_path="full_episode_inference.png"):
         """Create multi-step prediction visualization for the full episode (English annotation, only plot t+1 prediction for all timesteps)"""
         gt_states = results['gt_states']
-        pred_states = results['pred_states'][..., :14]  # Only first 14 dims
+        pred_states_raw = results['pred_states']
         future_steps = results['future_steps']
+
+        # 处理预测数据形状：从(200, 30, 50, 32)选择指定步的前14维 -> (200, 30, 14)
+        if len(pred_states_raw.shape) == 4:  # (timesteps, future_steps, action_horizon, action_dim)
+            # 使用统一的prediction_step选择哪一步动作的前14维
+            pred_states = pred_states_raw[:, :, self.prediction_step, :14]
+            logger.info(f"可视化使用第{self.prediction_step}步预测 (共{pred_states_raw.shape[2]}步)")
+        else:
+            # 如果已经是正确形状，直接使用前14维
+            pred_states = pred_states_raw[..., :14]
 
         # Check array shapes
         if len(gt_states.shape) < 3 or len(pred_states.shape) < 3:
@@ -409,16 +422,102 @@ class FullEpisodeInferenceVisualizer:
 
         self.print_multi_step_prediction_stats(results)
         return save_path
-        
+
+    def create_multi_step_comparison_plot(self, results, save_path="multi_step_comparison.png", max_timesteps=10, prediction_horizon=20):
+        """创建多步预测对比图，每个时刻的预测轨迹用一条线段表示"""
+        gt_states = results['gt_states']
+        pred_states_raw = results['pred_states']
+
+        # 处理预测数据形状：从(200, 30, 50, 32)获取多步预测
+        if len(pred_states_raw.shape) != 4:
+            logger.error(f"预测数据形状不正确: {pred_states_raw.shape}, 期望4维")
+            return None
+
+        total_timesteps = pred_states_raw.shape[0]
+        available_horizon = pred_states_raw.shape[2]  # 50步
+
+        # 限制显示的时间步数和预测步长
+        max_timesteps = min(max_timesteps, total_timesteps)
+        prediction_horizon = min(prediction_horizon, available_horizon)
+
+        # 生成颜色映射 - 每个时刻一种颜色
+        colors = plt.cm.tab20(np.linspace(0, 1, max_timesteps))
+
+        # 创建子图：14个关节，每个关节一行
+        fig, axes = plt.subplots(14, 1, figsize=(24, 3.5*14), sharex=True)
+        fig.subplots_adjust(hspace=0.35)
+        fig.suptitle(
+            f'Multi-Timestep Prediction Trajectories\n'
+            f'Showing {max_timesteps} timesteps, each predicting {prediction_horizon} steps ahead',
+            fontsize=16, fontweight='bold', y=0.995
+        )
+
+        for joint_idx in range(14):
+            ax = axes[joint_idx]
+
+            # 绘制GT轨迹
+            gt_full = gt_states[:, 0, joint_idx]  # 完整的GT轨迹
+            ax.plot(range(len(gt_full)), gt_full, color='black', linewidth=3, label='Ground Truth', alpha=0.8)
+
+            # 绘制每个时刻的预测轨迹
+            for t_idx in range(0, max_timesteps, 10):  # 每10步画一条轨迹
+                color = colors[t_idx % len(colors)]
+
+                # 获取在时刻t_idx的预测轨迹（未来prediction_horizon步）
+                pred_trajectory = pred_states_raw[t_idx, 0, :prediction_horizon, joint_idx]
+
+                # 时间轴：从t_idx+1开始的prediction_horizon步
+                time_axis = range(t_idx + 1, t_idx + 1 + prediction_horizon)
+
+                # 确保不超出总时间范围
+                if time_axis[-1] < len(gt_full):
+                    ax.plot(time_axis, pred_trajectory,
+                           color=color,
+                           linewidth=2,
+                           alpha=0.7,
+                           label=f'Pred from t={t_idx}' if joint_idx == 0 else "",
+                           linestyle='-')
+
+                    # 在起始点添加标记
+                    ax.scatter(t_idx + 1, pred_trajectory[0], color=color, s=30, alpha=0.8, zorder=5)
+
+            # 设置子图属性
+            ax.set_ylabel(f'{self.joint_names[joint_idx]}\nValue', fontsize=10, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0, min(len(gt_full), max_timesteps + prediction_horizon))
+
+            # 只在第一个子图显示图例
+            if joint_idx == 0:
+                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+
+            # 添加说明文本
+            actual_trajectories = len(range(0, max_timesteps, 10))
+            ax.text(0.02, 0.98, f'Showing {actual_trajectories} prediction trajectories (every 10 steps)',
+                   transform=ax.transAxes, fontsize=8,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+
+        axes[-1].set_xlabel('Timestep', fontsize=12, fontweight='bold')
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"多时刻预测轨迹图已保存到: {save_path} (显示{max_timesteps}个时刻，每个预测{prediction_horizon}步)")
+        return save_path
+
     def print_multi_step_prediction_stats(self, results):
         """打印多步预测的综合统计信息"""
-        
+
         gt_states = results['gt_states']
-        pred_states = results['pred_states']
+        pred_states_raw = results['pred_states']
         future_steps = results['future_steps']
-        
-        # 只取前 14 维
-        pred_states = pred_states[..., :14]
+
+        # 处理预测数据形状：从(200, 30, 50, 32)选择指定步的前14维 -> (200, 30, 14)
+        if len(pred_states_raw.shape) == 4:  # (timesteps, future_steps, action_horizon, action_dim)
+            # 使用统一的prediction_step选择哪一步动作的前14维
+            pred_states = pred_states_raw[:, :, self.prediction_step, :14]
+        else:
+            # 如果已经是正确形状，直接使用前14维
+            pred_states = pred_states_raw[..., :14]
         
         print("\n" + "="*90)
         print(f"📊 完整剧集 {results['episode_idx']} 未来{future_steps}步预测分析")
@@ -456,29 +555,6 @@ class FullEpisodeInferenceVisualizer:
             
         print("="*90)
 
-    def add_image_noise(self, image, sigma=10):
-        """对图像添加高斯噪声"""
-        if image.dtype != np.uint8:
-            image = (image * 255).astype(np.uint8)
-        noise = np.random.normal(0, sigma, image.shape)
-        noisy = np.clip(image + noise, 0, 255).astype(np.uint8)
-        return noisy
-
-    def random_image_mask(self, image, mask_ratio=0.2):
-        """对图像随机遮挡一块区域"""
-        h, w = image.shape[:2]
-        mask_h, mask_w = int(h * mask_ratio), int(w * mask_ratio)
-        if mask_h == 0 or mask_w == 0:
-            return image
-        top = np.random.randint(0, h - mask_h + 1)
-        left = np.random.randint(0, w - mask_w + 1)
-        image = image.copy()
-        image[top:top+mask_h, left:left+mask_w] = 0
-        return image
-
-    def add_state_noise(self, state, sigma=0.01):
-        """对状态向量添加高斯噪声"""
-        return state + np.random.normal(0, sigma, state.shape)
 
 def main():
     """Main function"""
@@ -486,11 +562,9 @@ def main():
     """
 python inference_piper/inference_with_dis_openloop.py \
   --host localhost --port 8000 \
-  --data_path /home/q/data/pick_and_place_eggplant/openpi \
-  --episode 0 --step_limit 20 --output my_infer.png \
-  --future_steps 30 --debug \
-  --image_noise 10 --state_noise 0.01 --random_mask 0.2
-  
+  --data_path /home/testuser/data/pick_and_place_eggplant/openpi_33fps \
+  --episode 0 --step_limit 200 --output my_infer.png \
+  --future_steps 30 --prediction_step 29
       """
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="OpenPI完整剧集推理可视化（带扰动）")
@@ -511,25 +585,26 @@ python inference_piper/inference_with_dis_openloop.py \
                         help="启用调试模式，打印更多信息")
     parser.add_argument("--future_steps", type=int, default=30,
                         help="要预测的未来步骤数量")
-    # 新增扰动参数
-    parser.add_argument("--image_noise", type=float, default=0, help="图像高斯噪声强度，0为不加噪声")
-    parser.add_argument("--state_noise", type=float, default=0, help="状态高斯噪声强度，0为不加噪声")
-    parser.add_argument("--random_mask", type=float, default=0, help="图像随机遮挡比例，0为不遮挡")
+    parser.add_argument("--prediction_step", type=int, default=0,
+                        help="选择哪一步预测进行对比和可视化 (0:第一步, -1:最后一步)")
+    parser.add_argument("--multi_step_plot", action="store_true",
+                        help="生成多时刻预测轨迹对比图")
+    parser.add_argument("--max_timesteps", type=int, default=10,
+                        help="显示多少个时刻的预测轨迹")
+    parser.add_argument("--prediction_horizon", type=int, default=20,
+                        help="每个时刻预测多少步的轨迹")
     args = parser.parse_args()
     # 如果设置为0表示不限制
     step_limit = None if args.step_limit == 0 else args.step_limit
     try:
         # 初始化可视化器
         visualizer = FullEpisodeInferenceVisualizer(
-            host=args.host, 
-            port=args.port, 
+            host=args.host,
+            port=args.port,
             data_path=args.data_path,
-            debug=args.debug
+            debug=args.debug,
+            prediction_step=args.prediction_step
         )
-        # 设置扰动参数
-        visualizer.image_noise = args.image_noise
-        visualizer.state_noise = args.state_noise
-        visualizer.random_mask = args.random_mask
         # 连接服务器
         if not visualizer.connect_to_server():
             logger.error("无法连接到推理服务器，请确保服务器正在运行")
@@ -538,7 +613,7 @@ python inference_piper/inference_with_dis_openloop.py \
         if not visualizer.load_gt_data():
             logger.error("无法加载地面真值数据，请检查数据路径")
             return 1
-        logger.info(f"开始为剧集 {args.episode} 进行完整分析...（扰动参数：image_noise={args.image_noise}, state_noise={args.state_noise}, random_mask={args.random_mask}）")
+        logger.info(f"开始为剧集 {args.episode} 进行完整分析...")
         # 运行完整剧集推理
         results = visualizer.run_full_episode_inference(
             episode_idx=args.episode, 
@@ -552,6 +627,13 @@ python inference_piper/inference_with_dis_openloop.py \
         # 创建可视化
         visualizer.create_full_episode_plot(results, args.output)
         logger.info(f"完整剧集可视化已完成！结果保存到: {args.output}")
+
+        # 如果需要，创建多时刻预测轨迹对比图
+        if args.multi_step_plot:
+            multi_step_output = args.output.replace('.png', '_multi_step.png')
+            visualizer.create_multi_step_comparison_plot(results, multi_step_output, args.max_timesteps, args.prediction_horizon)
+            logger.info(f"多时刻预测轨迹图已完成！结果保存到: {multi_step_output}")
+
         return 0
     except KeyboardInterrupt:
         logger.info("用户中断了操作")
