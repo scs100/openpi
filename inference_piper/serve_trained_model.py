@@ -87,12 +87,14 @@ def create_policy(model_config: TrainedModelConfig):
     return policy
 """
 使用示例:
-python inference_piper/serve_trained_model.py \
-     --checkpoint_dir checkpoints/lora_training/rgb_lora_sgd_lr1e-4/39999 \
-     --config_name lora_training \
-     --default_prompt "pick then long eggplant and place on the plant" \
-     --port 8000 \
-     --host 0.0.0.0
+# 加载episode 10
+python inference_piper/inference_with_dis_openloop.py \
+  --host localhost --port 8000 \
+  --data_path /home/testuser/data/pick_and_place_eggplant/openpi_33fps \
+  --episode 10 --step_limit 200 --output my_infer.png \
+  --future_steps 30 --prediction_step 0 \
+  --multi_step_plot --max_timesteps 200 --prediction_horizon 30
+
 """
 def main():
     """主函数"""
