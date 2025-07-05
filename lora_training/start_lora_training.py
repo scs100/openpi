@@ -60,7 +60,7 @@ BATCH_SIZE = ADAMW_BATCH_SIZE if USE_ADAMW else SGD_BATCH_SIZE
 
 NUM_WORKERS = 0            # 预加载使用单进程即可
 SAVE_INTERVAL = 1000       # 保存间隔 (每1000步保存，大幅减少内存压力)
-NUM_TRAIN_STEPS = 40000     # 训练步数 (增加到20k，持续训练)
+NUM_TRAIN_STEPS = 100000     # 训练步数 (增加到20k，持续训练)
 LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
 KEEP_PERIOD = 2000          # 检查点保留周期 (每1000步的检查点永久保留)
 

@@ -233,8 +233,20 @@ class FullEpisodeInferenceVisualizer:
                             mapped_key = image_key_map.get(cam_name, cam_name)
                             if isinstance(img_data, dict) and 'bytes' in img_data:
                                 images[mapped_key] = decode_image(img_data['bytes'])
+                                # # debug，用PIL保存图片查看是否正常
+                                # if self.debug and step_idx < 3:  # 只保存前3步的图片
+                                #     debug_img = Image.fromarray(images[mapped_key])
+                                #     debug_path = f"debug_step_{step_idx}_{mapped_key}.png"
+                                #     debug_img.save(debug_path)
+                                #     logger.info(f"Debug: 保存图片到 {debug_path}, 形状: {images[mapped_key].shape}")
                             elif isinstance(img_data, bytes):
                                 images[mapped_key] = decode_image(img_data)
+                                # # debug，用PIL保存图片查看是否正常
+                                # if self.debug and step_idx < 3:  # 只保存前3步的图片
+                                #     debug_img = Image.fromarray(images[mapped_key])
+                                #     debug_path = f"debug_step_{step_idx}_{mapped_key}.png"
+                                #     debug_img.save(debug_path)
+                                #     logger.info(f"Debug: 保存图片到 {debug_path}, 形状: {images[mapped_key].shape}")
                             else:
                                 images[mapped_key] = img_data
 

@@ -99,16 +99,18 @@ class FixedDataset:
             # 解码图像
             img_array = np.frombuffer(img_bytes, dtype=np.uint8)
             img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            
+            #debug
+           
             if img is None:
                 return np.zeros((224, 224, 3), dtype=np.float32)
-
+            #pkl2openpi  实现的rgb 不同转换
             # cv2.imdecode总是输出BGR格式，转换为RGB格式
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
+            # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            # cv2.imwrite(f"debugnocvt.jpg", img)
+            # import pdb; pdb.set_trace()
             # 调整大小到224x224
             img = cv2.resize(img, (224, 224))
-          
+
             # 归一化到[-1, 1]
             img_array = img.astype(np.float32) / 255.0
             img_array = img_array * 2.0 - 1.0
