@@ -23,6 +23,7 @@ import subprocess
 import threading
 import time
 import signal
+import argparse
 from datetime import datetime
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -34,21 +35,36 @@ from contextlib import redirect_stdout, redirect_stderr
 
 sys.path.insert(0, os.path.abspath('.'))
 
+def parse_args():
+    """解析命令行参数 - 只处理 resume 和 overwrite"""
+    parser = argparse.ArgumentParser(description='OpenPI LoRA 训练脚本')
+
+    # 训练控制参数
+    parser.add_argument('--resume', action='store_true',
+                       help='恢复训练')
+    parser.add_argument('--overwrite', action='store_true',
+                       help='覆盖现有检查点')
+
+    return parser.parse_args()
+
+# 解析命令行参数
+args = parse_args()
+
 # 配置常量定义
 # 数据配置
-DATASET_PATH = "/home/testuser/data/pick_and_place_eggplant/openpi_33fps"  # 修改为您的数据集路径
-DATASET_NAME = "pick_and_place_eggplant_33fps"  # 修改为您的数据集名称
-DEFAULT_PROMPT = "pick then long eggplant and place on the plant" # 修改为您的任务描述
+DATASET_PATH = "/home/q/data/pick_up_parts_from_belt_conveyor_place_on_plate_fast_250702/openpi"  # 修改为您的数据集路径
+DATASET_NAME = "pick_up_parts_from_belt_conveyor_place_on_plate_fast"  # 修改为您的数据集名称  ⚠️注意不要有空格
+DEFAULT_PROMPT = "pick_up_parts_from_belt_conveyor_place_on_plate_fast" # 修改为您的任务描述
 # 训练帧率配置 - 已废弃，现在使用数据集原始时间序列
-TRAINING_FPS = 33.3  # ⚠️ 此参数已不再使用，帧率在数据预处理时确定
+# TRAINING_FPS = 33.3  # ⚠️ 此参数已不再使用，帧率在数据预处理时确定
 # 实验配置
-EXPERIMENT_NAME = "rgb_lora_sgd_lr1e-4"  # 修改为您的实验名称
-WANDB_PROJECT = "lora_eggplant"  # 修改为您的WandB项目名
+EXPERIMENT_NAME = "rgb_sgd09_bat6_lr1e4"  # 修改为您的实验名称
+WANDB_PROJECT = "lora_16_belt_conveyor"  # 修改为您的WandB项目名
 # WandB配置
 FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
-# 恢复训练配置
-RESUME_TRAINING = True           # 启用恢复训练
-OVERWRITE_CHECKPOINT = False   #
+# 恢复训练配置 - 从命令行参数获取
+RESUME_TRAINING = args.resume           # 从命令行参数获取
+OVERWRITE_CHECKPOINT = args.overwrite   # 从命令行参数获取
 
 # 优化器选择配置
 USE_ADAMW = False           # True: 使用AdamW, False: 使用SGD
@@ -666,13 +682,15 @@ def optimize_system_memory():
         os.environ['JAX_COMPILATION_CACHE_DIR'] = ''
         os.environ['JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES'] = '999999999'
 
-    # XLA优化 - 恢复训练时更保守
+    # XLA优化 - 充分利用32核CPU加速编译
     if RESUME_TRAINING:
-        # 使用有效的XLA内存优化设置
-        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=1'
-        print("🔧 恢复训练模式：使用保守的XLA设置")
+        # 恢复训练时使用中等线程数
+        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=8'
+        print("🔧 恢复训练模式：使用XLA编译（8线程）")
     else:
-        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=1'
+        # 首次训练使用更多线程充分利用32核CPU
+        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=16'
+        print("🚀 首次训练模式：使用加速XLA编译（16线程，充分利用32核CPU）")
 
     # 系统内存优化
     os.environ['MALLOC_TRIM_THRESHOLD_'] = '0'
@@ -758,7 +776,7 @@ def patch_memory_optimized_data_loader():
     from openpi.training import data_loader as _data_loader
     from openpi.training import config as _config
     from openpi.models import model as _model
-    from fixed_dataset import FixedDataset
+    from lora_training.fixed_tienkung_dataset import FixedDataset
 
     # 保存原始函数
     original_create_dataset = _data_loader.create_dataset
@@ -779,12 +797,13 @@ def patch_memory_optimized_data_loader():
             print(f"🎬 训练配置: 使用原始时间序列，不进行帧率采样")
 
             # 计算时间跨度信息（基于数据集原始fps）
-            print(f"⏰ 50步动作序列为连续50帧")
+            print(f"⏰ {ACTION_HORIZON}步动作序列为连续{ACTION_HORIZON}帧")
 
             return FixedDataset(
                 data_path=DATASET_PATH,
                 default_prompt=DEFAULT_PROMPT,
-                preload_episodes=None  # 自动加载所有parquet文件
+                preload_episodes=None,  # 自动加载所有parquet文件
+                action_horizon=ACTION_HORIZON  # 从训练配置传递action_horizon
             )
 
         # 其他情况使用原始函数
@@ -1278,17 +1297,47 @@ if __name__ == "__main__":
     print(f"🚀 {optimizer_name}主动Swap管理训练 - 20K步正式训练")
     print("=" * 60)
     print("🎯 目标: 20000步持续训练，每2000步保存权重")
-    print("💡 策略: 实时监控 + 主动清理 + WandB在线记录 + Terminal输出捕获")
+    print("� 策略: 实时监控 + 主动清理 + WandB在线记录 + Terminal输出捕获")
     print(f"⚙️ 优化器: {optimizer_name} (批量大小: {BATCH_SIZE}, GPU内存: {GPU_MEM_FRACTION})")
     print(f"📝 日志文件: {log_file}")
     print(f"🔄 恢复训练: {'启用' if RESUME_TRAINING else '禁用'}")
     print(f"📁 覆盖检查点: {'是' if OVERWRITE_CHECKPOINT else '否'}")
     print("=" * 60)
 
+    # 在训练开始前计算归一化统计
+    print("\n📊 计算数据集归一化统计...")
+    try:
+        # 明确导入 lora_training 目录下的版本
+        import importlib.util
+        import sys
+
+        # 构建完整路径
+        compute_norm_path = os.path.join(os.path.dirname(__file__), 'compute_norm_stats.py')
+        spec = importlib.util.spec_from_file_location("compute_norm_stats", compute_norm_path)
+        compute_norm_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(compute_norm_module)
+
+        # 调用归一化统计计算
+        success = compute_norm_module.main(
+            data_path=DATASET_PATH,
+            dataset_name=DATASET_NAME
+        )
+
+        if success:
+            print("✅ 归一化统计计算完成！")
+        else:
+            print("⚠️ 归一化统计计算失败，但训练将继续...")
+
+    except Exception as e:
+        print(f"⚠️ 归一化统计计算出错: {e}")
+        print("🔄 训练将继续进行...")
+
+    print("=" * 60)
+
     # 使用TerminalOutputCapture捕获所有输出
     from log_utils import TerminalOutputCapture
 
-    with TerminalOutputCapture(log_file, "sgd_20k_training") as capture_logger:
+    with TerminalOutputCapture(log_file, EXPERIMENT_NAME) as capture_logger:
         capture_logger.info("🔍 开始捕获所有terminal输出到日志文件")
 
         # 创建Swap管理器

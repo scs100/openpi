@@ -10,8 +10,8 @@ import tqdm
 from pathlib import Path
 import openpi.shared.normalize as normalize
 
-def load_dataset(data_path, action_dim=14, state_dim=14):
-    """加载 LeRobot 格式数据集"""
+def load_dataset(data_path):
+    """加载 LeRobot 格式数据集，提取所有维度的状态和动作数据"""
     data_path = Path(data_path)
 
     # 查找所有parquet文件
@@ -28,9 +28,9 @@ def load_dataset(data_path, action_dim=14, state_dim=14):
         try:
             df = pd.read_parquet(file_path)
 
-            # 提取状态和动作数据，支持不同维度
-            states = np.array([np.array(state)[:state_dim] for state in df['observation.state']])
-            actions = np.array([np.array(action)[:action_dim] for action in df['action']])
+            # 提取状态和动作数据，提取所有维度
+            states = np.array([np.array(state) for state in df['observation.state']])
+            actions = np.array([np.array(action) for action in df['action']])
 
             all_states.append(states)
             all_actions.append(actions)
@@ -130,7 +130,7 @@ def save_norm_stats(norm_stats, output_dir, dataset_name):
     print(f"Files created:")
     print(f"  - {output_path}/norm_stats.json")
 
-def main(data_path=None, dataset_name=None, action_dim=14, state_dim=14):
+def main(data_path=None, dataset_name=None):
     """主函数"""
     if data_path is None:
         data_path = input("请输入数据集路径: ").strip()
@@ -140,7 +140,7 @@ def main(data_path=None, dataset_name=None, action_dim=14, state_dim=14):
     try:
         # 加载数据
         print(f"Loading dataset from {data_path}...")
-        states, actions = load_dataset(data_path, action_dim, state_dim)
+        states, actions = load_dataset(data_path)
 
         # 计算统计信息
         print("\nComputing normalization statistics...")

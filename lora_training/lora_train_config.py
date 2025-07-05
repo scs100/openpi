@@ -18,94 +18,6 @@ import flax.nnx as nnx
 # 从config模块导入DataConfig
 DataConfig = _config.DataConfig
 
-class CustomDataset:
-    """通用数据集加载器 - 支持 LeRobot 格式数据集"""
-
-    def __init__(self, data_path: str, default_prompt: str = "perform the task"):
-        self.data_path = Path(data_path)
-        self.default_prompt = default_prompt
-
-        # 加载数据
-        self._load_data()
-    
-    def _load_data(self):
-        """加载parquet数据"""
-        import pandas as pd
-        import json
-        
-        # 加载所有parquet文件
-        parquet_files = list(self.data_path.glob("data/chunk-*/episode_*.parquet"))
-        parquet_files.sort()
-        
-        self.samples = []
-        for file_path in parquet_files:
-            df = pd.read_parquet(file_path)
-            self.samples.extend(df.to_dict('records'))
-        
-        print(f"✅ 加载了 {len(self.samples)} 个样本")
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        
-        # 处理图像
-        images = {}
-        image_name_mapping = {
-            'exterior_image_1_left': 'base_0_rgb',
-            'wrist_image_left': 'left_wrist_0_rgb', 
-            'wrist_image_right': 'right_wrist_0_rgb'
-        }
-        
-        for key, value in sample.items():
-            if key.startswith("observation.images."):
-                img_name = key.replace("observation.images.", "")
-                if isinstance(value, dict) and 'bytes' in value:
-                    # 使用cv2解码以正确处理BGR格式
-                    import cv2
-                    img_bytes = value['bytes']
-                    img_array = np.frombuffer(img_bytes, dtype=np.uint8)
-                    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-                    # ⚠️ 关键：OpenCV返回BGR，OpenPI需要RGB，进行转换
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-                    # 转换为float32并归一化到[-1, 1]
-                    img_array = img.astype(np.float32) / 255.0
-                    img_array = img_array * 2.0 - 1.0
-
-                    # 映射键名
-                    mapped_name = image_name_mapping.get(img_name, img_name)
-                    images[mapped_name] = img_array
-        
-        # 处理动作 (14维 -> 32维)
-        action_14d = np.array(sample["action"], dtype=np.float32)
-        action_32d = np.zeros(32, dtype=np.float32)
-        action_32d[:14] = action_14d
-        
-        # 处理状态 (14维 -> 32维)
-        state_14d = np.array(sample["observation.state"], dtype=np.float32)
-        state_32d = np.zeros(32, dtype=np.float32)
-        state_32d[:14] = state_14d
-        
-        # 确保所有数据类型都是JAX兼容的
-        # 注意：使用OpenPI期望的字段名
-
-        # 创建image_mask - 所有图像都是有效的
-        # 注意：OpenPI期望image_mask只有批量维度，不是空间维度
-        image_masks = {}
-        for key in images.keys():
-            # 创建标量True，表示这个图像是有效的
-            image_masks[key] = np.array(True, dtype=bool)  # 标量bool
-
-        return {
-            "image": images,                            # OpenPI期望"image"而不是"images"
-            "image_mask": image_masks,                  # 图像mask
-            "state": state_32d.astype(np.float32),      # 确保float32
-            "actions": action_32d.astype(np.float32),   # 确保float32
-        }
-
 @dataclasses.dataclass(frozen=True)
 class CustomDataConfig(_config.DataConfigFactory):
     """通用数据配置工厂 - 智能适配真实数据或假数据"""
@@ -153,43 +65,8 @@ class CustomDataConfig(_config.DataConfigFactory):
                 model_transforms=model_transforms,  # 使用标准的model transforms
             )
         else:
-            print(f"⚠️  数据路径不存在: {self.data_path}")
-            print("🔄 使用假数据进行LoRA微调测试")
-            return DataConfig(
-                repo_id="fake",  # 使用假数据
-            )
+            print(f"❌ 数据路径不存在: {self.data_path}")
+            raise FileNotFoundError(f"指定的数据集路径不存在: {self.data_path}")
 
 
 
-
-if __name__ == "__main__":
-    print("🤖 OpenPI LoRA 微调通用配置")
-    print("=" * 50)
-
-    # 示例配置
-    data_path = "/path/to/your/dataset"
-    dataset_name = "your_dataset"
-    prompt = "perform the task"
-
- 
- 
-
-    print(f"\n🚀 使用方法:")
-    print(f"# 1. 导入配置模块")
-    print(f"from lora_train_config import create_lora_finetune_config")
-    print(f"")
-    print(f"# 2. 创建配置")
-    print(f"config = create_lora_finetune_config(")
-    print(f"    data_path='/path/to/your/dataset',")
-    print(f"    dataset_name='your_dataset',")
-    print(f"    prompt='your task description',")
-    print(f"    exp_name='my_experiment'")
-    print(f")")
-    print(f"")
-    print(f"# 3. 运行训练")
-    print(f"python scripts/train.py config")
-
-    print(f"\n� 提示:")
-    print(f"  - 确保数据路径存在且为 LeRobot 格式")
-    print(f"  - 使用 compute_norm_stats.py 预先计算归一化统计")
-    print(f"  - 根据GPU内存调整批量大小")
