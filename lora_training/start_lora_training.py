@@ -685,12 +685,12 @@ def optimize_system_memory():
     # XLA优化 - 充分利用32核CPU加速编译
     if RESUME_TRAINING:
         # 恢复训练时使用中等线程数
-        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=8'
-        print("🔧 恢复训练模式：使用XLA编译（8线程）")
+        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=20'
+        print("🔧 恢复训练模式：使用XLA编译（20线程）")
     else:
         # 首次训练使用更多线程充分利用32核CPU
-        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=16'
-        print("🚀 首次训练模式：使用加速XLA编译（16线程，充分利用32核CPU）")
+        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=28'
+        print("🚀 首次训练模式：使用加速XLA编译（28线程，充分利用32核CPU）")
 
     # 系统内存优化
     os.environ['MALLOC_TRIM_THRESHOLD_'] = '0'

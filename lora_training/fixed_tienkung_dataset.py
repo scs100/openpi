@@ -104,18 +104,17 @@ class FixedDataset:
             # 解码图像
             img_array = np.frombuffer(img_bytes, dtype=np.uint8)
             img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            #debug
-           
             if img is None:
                 return np.zeros((224, 224, 3), dtype=np.float32)
             #pkl2openpi  实现的rgb 不同转换
             # cv2.imdecode总是输出BGR格式，转换为RGB格式
             # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            # cv2.imwrite(f"debugnocvt.jpg", img)
-            # import pdb; pdb.set_trace()
+
             # 调整大小到224x224
             img = cv2.resize(img, (224, 224))
+            # cv2.imwrite(f"debugnocvt.jpg", img)
+            # import pdb; pdb.set_trace()
 
             # 归一化到[-1, 1]
             img_array = img.astype(np.float32) / 255.0
@@ -157,8 +156,7 @@ class FixedDataset:
             # 取实际维度，最多32维
             action_actual = action_array[:min(len(action_array), 32)]
 
-            if step == 0:  # 只在第一步打印调试信息
-                print(f"🔍 DEBUG: 动作维度: {len(action_actual)}, 值范围: [{action_actual.min():.3f}, {action_actual.max():.3f}]")
+
 
             # 填充到32维
             action_32d = np.zeros(32, dtype=np.float32)
@@ -168,7 +166,7 @@ class FixedDataset:
         return np.array(actions_sequence, dtype=np.float32)
 
     def __getitem__(self, idx):
-        print(f"🔍 DEBUG: __getitem__ 被调用，idx={idx}")
+
         if idx >= len(self.file_index):
             raise IndexError(f"索引 {idx} 超出范围 {len(self.file_index)}")
 
@@ -177,22 +175,17 @@ class FixedDataset:
 
         # 获取当前时刻的数据
         current_sample = episode_df.iloc[timestep].to_dict()
-        print(f"🔍 DEBUG: 获取样本数据完成，episode_id={episode_id}, timestep={timestep}")
+
         
         # 处理图像 - 提供模型期望的所有相机
         images = {}
 
         # 处理图像数据 - 严格检查
-        print(f"🔍 DEBUG: 开始处理图像，current_sample keys: {list(current_sample.keys())}")
-
         # 检查直接的图像键（如 'base_0_rgb'）
         base_image_found = False
         for key, value in current_sample.items():
             if 'base' in key.lower() and 'rgb' in key.lower():
-                print(f"🔍 DEBUG: 找到直接图像键 {key}")
-                print(f"🔍 DEBUG: 图像数据类型: {type(value)}")
                 if isinstance(value, dict) and 'bytes' in value:
-                    print(f"🔍 DEBUG: 处理字节格式图像")
                     img_array = self._process_image(value)
                     images['base_0_rgb'] = img_array
                     base_image_found = True
@@ -205,9 +198,7 @@ class FixedDataset:
             for key, value in current_sample.items():
                 if key.startswith("observation.images."):
                     img_name = key.replace("observation.images.", "")
-                    print(f"🔍 DEBUG: 找到observation格式图像 {img_name}")
                     if 'base' in img_name.lower() or 'exterior' in img_name.lower():
-                        print(f"🔍 DEBUG: 处理base相机 {img_name}")
                         img_array = self._process_image(value)
                         images['base_0_rgb'] = img_array
                         base_image_found = True
@@ -225,7 +216,6 @@ class FixedDataset:
                 images[camera_name] = np.zeros((224, 224, 3), dtype=np.float32)
 
         # 处理状态 - 严格检查并自动识别维度
-        print(f"🔍 DEBUG: 开始处理状态数据")
         state_data = None
 
         # 检查可能的状态键
@@ -233,7 +223,6 @@ class FixedDataset:
         for state_key in possible_state_keys:
             if state_key in current_sample:
                 state_data = current_sample[state_key]
-                print(f"🔍 DEBUG: 找到状态数据，键: {state_key}, 类型: {type(state_data)}")
                 break
 
         if state_data is None:
@@ -244,7 +233,6 @@ class FixedDataset:
             state_array = np.array(state_data, dtype=np.float32)
             # 取实际维度，最多32维
             state_actual = state_array[:min(len(state_array), 32)]
-            print(f"🔍 DEBUG: 状态维度: {len(state_actual)}")
         else:
             raise ValueError(f"❌ 状态数据格式错误！期望非空list/array，得到: {type(state_data)}, 长度: {len(state_data) if hasattr(state_data, '__len__') else 'N/A'}")
 
