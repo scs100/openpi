@@ -33,16 +33,18 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass
 class TrainedModelConfig:
     """训练模型配置"""
-    checkpoint_dir: str = "checkpoints/lora_training/rgb_lora_sgd_lr1e-4/16000"
-    config_name: str = "lora_training"
-    default_prompt: str = "pick the long eggplant and place on the plant"
+    checkpoint_dir: str
+    config_name: str
+    default_prompt: str
+    dataset_name: str
+    data_path: str
     port: int = 8000
     host: str = "0.0.0.0"
 
-def create_trained_model_config(config_name: str = "lora_training"):
+def create_trained_model_config(config_name: str, dataset_name: str, data_path: str, default_prompt: str):
     """创建与训练时相同的模型配置"""
     # 导入数据配置
-    from pick_and_place_egglant.eggplant_train_config import EggplantDataConfig
+    from lora_training.lora_train_config import CustomDataConfig
     from openpi.training.weight_loaders import CheckpointWeightLoader
 
     config = _config.TrainConfig(
@@ -56,11 +58,12 @@ def create_trained_model_config(config_name: str = "lora_training"):
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora"
         ),
-        
-        # 数据配置 - 使用训练时的norm stats
-        data=EggplantDataConfig(
-            data_path="/home/testuser/data/pick_and_place_eggplant/openpi_33fps",
-            default_prompt="pick the long eggplant and place on the plant",
+
+        # 数据配置 - 使用命令行传入的参数
+        data=CustomDataConfig(
+            data_path=data_path,
+            default_prompt=default_prompt,
+            dataset_name=dataset_name
         ),
 
         # 权重加载器
@@ -72,9 +75,16 @@ def create_policy(model_config: TrainedModelConfig):
     """创建训练好的策略"""
     logger.info(f"正在加载训练好的模型...")
     logger.info(f"检查点目录: {model_config.checkpoint_dir}")
+    logger.info(f"数据路径: {model_config.data_path}")
+    logger.info(f"数据集名称: {model_config.dataset_name}")
 
     # 创建配置
-    config = create_trained_model_config(model_config.config_name)
+    config = create_trained_model_config(
+        model_config.config_name,
+        model_config.dataset_name,
+        model_config.data_path,
+        model_config.default_prompt
+    )
 
     # 创建训练好的策略
     policy = _policy_config.create_trained_policy(
@@ -87,12 +97,14 @@ def create_policy(model_config: TrainedModelConfig):
     return policy
 """
 使用示例:
-# 加载episode 10
+# 所有主要参数都是必需的
 conda activate openpi;
 python inference_piper/serve_trained_model.py \
      --checkpoint_dir checkpoints/lora_training/lora_sgd_bat6_10w_lr1e-4/16000 \
      --config_name lora_training \
      --default_prompt "pick the long eggplant and place on the plant" \
+     --dataset_name "pick_and_place_eggplant_33fps" \
+     --data_path "/home/testuser/data/pick_and_place_eggplant/openpi_33fps" \
      --port 8000 \
      --host 0.0.0.0
 
@@ -104,14 +116,20 @@ def main():
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="启动训练好的OpenPI模型推理服务器")
     parser.add_argument("--checkpoint_dir",
-                        default="checkpoints/lora_training/rgb_lora_sgd_lr1e-4/16000",
-                        help="检查点目录路径")
+                        required=True,
+                        help="检查点目录路径 (必需)")
     parser.add_argument("--config_name",
-                        default="lora_training",
-                        help="配置名称")
+                        required=True,
+                        help="配置名称 (必需)")
     parser.add_argument("--default_prompt",
-                        default="pick the long eggplant and place on the plant",
-                        help="默认提示词")
+                        required=True,
+                        help="默认提示词 (必需)")
+    parser.add_argument("--dataset_name",
+                        required=True,
+                        help="数据集名称，用于加载norm stats (必需)")
+    parser.add_argument("--data_path",
+                        required=True,
+                        help="数据集路径 (必需)")
     parser.add_argument("--port", type=int, default=8000, help="服务器端口")
     parser.add_argument("--host", default="0.0.0.0", help="服务器主机地址")
 
@@ -122,6 +140,8 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         config_name=args.config_name,
         default_prompt=args.default_prompt,
+        dataset_name=args.dataset_name,
+        data_path=args.data_path,
         port=args.port,
         host=args.host
     )
