@@ -14,11 +14,12 @@ import cv2
 
 class FixedDataset:
     """修复版数据集加载器 - 正确处理动作序列和数据格式"""
-    
+
     def __init__(self, data_path: str, default_prompt: str = "perform the task",
-                 preload_episodes: int = None):
+                 preload_episodes: int = None, action_horizon: int = 50):
         self.data_path = Path(data_path)
         self.default_prompt = default_prompt
+        self.action_horizon = action_horizon
 
         # 读取数据集的fps信息（仅用于显示）
         self.data_fps = self._read_dataset_fps()
@@ -30,6 +31,7 @@ class FixedDataset:
         print(f"  - 预加载 {len(self.preloaded_episodes)} 个episodes")
         print(f"  - 总样本数: {len(self.file_index)}")
         print(f"  - 数据fps: {self.data_fps}")
+        print(f"  - 动作序列长度: {self.action_horizon}")
         print(f"  - 不进行帧率采样，使用原始时间序列")
 
     def _read_dataset_fps(self) -> float:
@@ -59,19 +61,18 @@ class FixedDataset:
         
         self.preloaded_episodes = {}
         self.file_index = []
-        action_horizon = 50
-        
+
         for i, file_path in enumerate(files_to_load):
             try:
                 print(f"📂 加载 {i+1}/{len(files_to_load)}: {file_path.name}")
-                
+
                 episode_id = file_path.stem
                 df = pd.read_parquet(file_path)
                 self.preloaded_episodes[episode_id] = df
-                
+
                 # 确保有足够的数据构造动作序列
                 num_rows = len(df)
-                valid_samples = max(0, num_rows - action_horizon)
+                valid_samples = max(0, num_rows - self.action_horizon)
                 
                 for timestep in range(valid_samples):
                     self.file_index.append((episode_id, timestep))
@@ -122,11 +123,10 @@ class FixedDataset:
             return np.zeros((224, 224, 3), dtype=np.float32)
 
     def _get_action_sequence(self, episode_df: pd.DataFrame, start_idx: int) -> np.ndarray:
-        """构造连续50步动作序列（不进行帧率采样）"""
-        action_horizon = 50
+        """构造连续动作序列（不进行帧率采样）"""
         actions_sequence = []
 
-        for step in range(action_horizon):
+        for step in range(self.action_horizon):
             # 计算目标帧索引 (从t+1时刻开始，连续50帧)
             target_idx = start_idx + 1 + step
 
@@ -273,3 +273,9 @@ if __name__ == "__main__":
         
     else:
         print(f"❌ 数据路径不存在: {data_path}")
+
+
+def create_fixed_dataset(data_path: str, default_prompt: str = "perform the task",
+                        preload_episodes: int = None, action_horizon: int = 50):
+    """创建修复版数据集"""
+    return FixedDataset(data_path, default_prompt, preload_episodes, action_horizon)

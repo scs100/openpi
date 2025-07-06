@@ -35,7 +35,7 @@ class TrainedModelConfig:
     """训练模型配置"""
     checkpoint_dir: str = "checkpoints/lora_training/rgb_lora_sgd_lr1e-4/16000"
     config_name: str = "lora_training"
-    default_prompt: str = "pick then long eggplant and place on the plant"
+    default_prompt: str = "pick the long eggplant and place on the plant"
     port: int = 8000
     host: str = "0.0.0.0"
 
@@ -60,7 +60,7 @@ def create_trained_model_config(config_name: str = "lora_training"):
         # 数据配置 - 使用训练时的norm stats
         data=EggplantDataConfig(
             data_path="/home/testuser/data/pick_and_place_eggplant/openpi_33fps",
-            default_prompt="pick then long eggplant and place on the plant",
+            default_prompt="pick the long eggplant and place on the plant",
         ),
 
         # 权重加载器
@@ -88,12 +88,13 @@ def create_policy(model_config: TrainedModelConfig):
 """
 使用示例:
 # 加载episode 10
-python inference_piper/inference_with_dis_openloop.py \
-  --host localhost --port 8000 \
-  --data_path /home/testuser/data/pick_and_place_eggplant/openpi_33fps \
-  --episode 10 --step_limit 200 --output my_infer.png \
-  --future_steps 30 --prediction_step 0 \
-  --multi_step_plot --max_timesteps 200 --prediction_horizon 30
+conda activate openpi;
+python inference_piper/serve_trained_model.py \
+     --checkpoint_dir checkpoints/lora_training/rgb_lora_sgd_lr1e-4/39999 \
+     --config_name lora_training \
+     --default_prompt "pick then long eggplant and place on the plant" \
+     --port 8000 \
+     --host 0.0.0.0
 
 """
 def main():
@@ -109,7 +110,7 @@ def main():
                         default="lora_training",
                         help="配置名称")
     parser.add_argument("--default_prompt",
-                        default="pick then long eggplant and place on the plant",
+                        default="pick the long eggplant and place on the plant",
                         help="默认提示词")
     parser.add_argument("--port", type=int, default=8000, help="服务器端口")
     parser.add_argument("--host", default="0.0.0.0", help="服务器主机地址")

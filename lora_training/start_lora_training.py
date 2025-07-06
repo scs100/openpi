@@ -52,14 +52,14 @@ args = parse_args()
 
 # 配置常量定义
 # 数据配置
-DATASET_PATH = "/home/q/data/pick_up_parts_from_belt_conveyor_place_on_plate_fast_250702/openpi"  # 修改为您的数据集路径
-DATASET_NAME = "pick_up_parts_from_belt_conveyor_place_on_plate_fast"  # 修改为您的数据集名称  ⚠️注意不要有空格
-DEFAULT_PROMPT = "pick_up_parts_from_belt_conveyor_place_on_plate_fast" # 修改为您的任务描述
+DATASET_PATH = "/home/testuser/data/pick_and_place_eggplant/openpi_33fps"  # 修改为您的数据集路径
+DATASET_NAME = "pick_and_place_eggplant_33fps"  # 修改为您的数据集名称
+DEFAULT_PROMPT = "pick the long eggplant and place on the plant" # 修改为您的任务描述
 # 训练帧率配置 - 已废弃，现在使用数据集原始时间序列
 # TRAINING_FPS = 33.3  # ⚠️ 此参数已不再使用，帧率在数据预处理时确定
 # 实验配置
-EXPERIMENT_NAME = "rgb_sgd09_bat6_lr1e4"  # 修改为您的实验名称
-WANDB_PROJECT = "lora_16_belt_conveyor"  # 修改为您的WandB项目名
+EXPERIMENT_NAME = "lora_sgd_bat6_10w_lr1e-4"  # 修改为您的实验名称
+WANDB_PROJECT = "lora_eggplant"  # 修改为您的WandB项目名
 # WandB配置
 FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
 # 恢复训练配置 - 从命令行参数获取
@@ -75,10 +75,10 @@ ADAMW_BATCH_SIZE = 4        # AdamW批量大小 (为额外内存需求预留空�
 BATCH_SIZE = ADAMW_BATCH_SIZE if USE_ADAMW else SGD_BATCH_SIZE
 
 NUM_WORKERS = 0            # 预加载使用单进程即可
-SAVE_INTERVAL = 1000       # 保存间隔 (每1000步保存，大幅减少内存压力)
-NUM_TRAIN_STEPS = 100000     # 训练步数 (增加到20k，持续训练)
+SAVE_INTERVAL = 2500       # 保存间隔 (每1000步保存，大幅减少内存压力)
+NUM_TRAIN_STEPS = 150000     # 训练步数 (增加到20k，持续训练)
 LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
-KEEP_PERIOD = 2000          # 检查点保留周期 (每1000步的检查点永久保留)
+KEEP_PERIOD = 5000          # 检查点保留周期 (每1000步的检查点永久保留)
 
 # 学习率配置 - 动态预热步数
 WARMUP_RATIO = 0.02         # 预热比例 (2% of total steps)
@@ -776,7 +776,7 @@ def patch_memory_optimized_data_loader():
     from openpi.training import data_loader as _data_loader
     from openpi.training import config as _config
     from openpi.models import model as _model
-    from lora_training.fixed_tienkung_dataset import FixedDataset
+    from lora_training.fixed_dataset import FixedDataset
 
     # 保存原始函数
     original_create_dataset = _data_loader.create_dataset
