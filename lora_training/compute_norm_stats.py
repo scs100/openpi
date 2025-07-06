@@ -116,8 +116,14 @@ def print_stats_summary(norm_stats):
             print(f"    Dim {i}: mean={stats.mean[i]:.6f}, std={stats.std[i]:.6f}")
         
         if key == "actions":
-            print(f"  Joint dimensions (0-13):")
-            for i in range(14):
+            # 自动检测有效的关节维度（非零标准差的维度）
+            valid_joints = []
+            for i in range(len(stats.std)):
+                if stats.std[i] > 1e-6:  # 标准差大于阈值认为是有效维度
+                    valid_joints.append(i)
+
+            print(f"  Joint dimensions (0-{len(valid_joints)-1}, total {len(valid_joints)} joints):")
+            for i in valid_joints:
                 print(f"    Joint {i}: mean={stats.mean[i]:.6f}, std={stats.std[i]:.6f}")
 
 def save_norm_stats(norm_stats, output_dir, dataset_name):
