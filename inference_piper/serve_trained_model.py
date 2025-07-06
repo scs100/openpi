@@ -90,9 +90,9 @@ def create_policy(model_config: TrainedModelConfig):
 # 加载episode 10
 conda activate openpi;
 python inference_piper/serve_trained_model.py \
-     --checkpoint_dir checkpoints/lora_training/rgb_lora_sgd_lr1e-4/39999 \
+     --checkpoint_dir checkpoints/lora_training/lora_sgd_bat6_10w_lr1e-4/16000 \
      --config_name lora_training \
-     --default_prompt "pick then long eggplant and place on the plant" \
+     --default_prompt "pick the long eggplant and place on the plant" \
      --port 8000 \
      --host 0.0.0.0
 

@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 
 def decode_image(img_bytes):
     img = Image.open(io.BytesIO(img_bytes))
-    return np.array(img)
+    img_array = np.array(img, dtype=np.float32) / 255.0
+    return img_array * 2.0 - 1.0  # 归一化到[-1,1]
 
 class FullEpisodeInferenceVisualizer:
     """Full episode inference visualizer"""
@@ -234,19 +235,23 @@ class FullEpisodeInferenceVisualizer:
                             if isinstance(img_data, dict) and 'bytes' in img_data:
                                 images[mapped_key] = decode_image(img_data['bytes'])
                                 # # debug，用PIL保存图片查看是否正常
-                                # if self.debug and step_idx < 3:  # 只保存前3步的图片
-                                #     debug_img = Image.fromarray(images[mapped_key])
-                                #     debug_path = f"debug_step_{step_idx}_{mapped_key}.png"
-                                #     debug_img.save(debug_path)
-                                #     logger.info(f"Debug: 保存图片到 {debug_path}, 形状: {images[mapped_key].shape}")
+                                if self.debug and step_idx < 3:  # 只保存前3步的图片
+                                    # 将[-1,1]的float32转换回[0,255]的uint8格式用于保存
+                                    debug_img_array = ((images[mapped_key] + 1.0) / 2.0 * 255.0).astype(np.uint8)
+                                    debug_img = Image.fromarray(debug_img_array)
+                                    debug_path = f"debug_step_{step_idx}_{mapped_key}.png"
+                                    debug_img.save(debug_path)
+                                    logger.info(f"Debug: 保存图片到 {debug_path}, 形状: {images[mapped_key].shape}")
                             elif isinstance(img_data, bytes):
                                 images[mapped_key] = decode_image(img_data)
                                 # # debug，用PIL保存图片查看是否正常
-                                # if self.debug and step_idx < 3:  # 只保存前3步的图片
-                                #     debug_img = Image.fromarray(images[mapped_key])
-                                #     debug_path = f"debug_step_{step_idx}_{mapped_key}.png"
-                                #     debug_img.save(debug_path)
-                                #     logger.info(f"Debug: 保存图片到 {debug_path}, 形状: {images[mapped_key].shape}")
+                                if self.debug and step_idx < 3:  # 只保存前3步的图片
+                                    # 将[-1,1]的float32转换回[0,255]的uint8格式用于保存
+                                    debug_img_array = ((images[mapped_key] + 1.0) / 2.0 * 255.0).astype(np.uint8)
+                                    debug_img = Image.fromarray(debug_img_array)
+                                    debug_path = f"debug_step_{step_idx}_{mapped_key}.png"
+                                    debug_img.save(debug_path)
+                                    logger.info(f"Debug: 保存图片到 {debug_path}, 形状: {images[mapped_key].shape}")
                             else:
                                 images[mapped_key] = img_data
 
@@ -599,11 +604,12 @@ def main():
     """Main function"""
     import argparse
     """
-python inference_piper/inference_with_dis_openloop.py \
+conda activate openpi && python inference_piper/inference_with_dis_openloop.py \
   --host localhost --port 8000 \
   --data_path /home/testuser/data/pick_and_place_eggplant/openpi_33fps \
   --episode 0 --step_limit 200 --output my_infer.png \
-  --future_steps 30 --prediction_step 29
+  --future_steps 50 --prediction_step 29    \
+  --multi_step_plot  --max_timesteps 200 --prediction_horizon 50
       """
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="OpenPI完整剧集推理可视化（带扰动）")
