@@ -58,7 +58,7 @@ DEFAULT_PROMPT = "pick_up_parts_from_belt_conveyor_place_on_plate_fast" # 修改
 # 训练帧率配置 - 已废弃，现在使用数据集原始时间序列
 # TRAINING_FPS = 33.3  # ⚠️ 此参数已不再使用，帧率在数据预处理时确定
 # 实验配置
-EXPERIMENT_NAME = "rgb_sgd09_bat6_lr1e4"  # 修改为您的实验名称
+EXPERIMENT_NAME = "rgb_sgd09_bat6_lr1e41e6_clip3"  # 修改为您的实验名称
 WANDB_PROJECT = "lora_16_belt_conveyor"  # 修改为您的WandB项目名
 # WandB配置
 FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
@@ -75,20 +75,20 @@ ADAMW_BATCH_SIZE = 4        # AdamW批量大小 (为额外内存需求预留空�
 BATCH_SIZE = ADAMW_BATCH_SIZE if USE_ADAMW else SGD_BATCH_SIZE
 
 NUM_WORKERS = 0            # 预加载使用单进程即可
-SAVE_INTERVAL = 2500       # 保存间隔 (每1000步保存，大幅减少内存压力)
-NUM_TRAIN_STEPS = 50000      # 训练步数 (减少到50k，避免过拟合导致梯度爆炸)
-LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
+SAVE_INTERVAL = 2500       # 保存间隔 (每2500步保存)
+NUM_TRAIN_STEPS = 250000      # 训练步数 (250k步长期训练)
+LOG_INTERVAL = 50           # 日志间隔 (更频繁记录，便于观察后期收敛)
 KEEP_PERIOD = 5000          # 检查点保留周期 (每1000步的检查点永久保留)
 
 # 学习率配置 - 动态预热步数
-WARMUP_RATIO = 0.02         # 预热比例 (2% of total steps)
+WARMUP_RATIO = 0.01         # 预热比例 (1% of total steps，更多步数用于精细调优)
 
 # SGD配置
-SGD_PEAK_LR = 5e-5          # SGD峰值学习率 (降低学习率以减少梯度震荡)
-SGD_DECAY_LR = 5e-6         # SGD最终学习率
-SGD_MOMENTUM = 0.9          # SGD动量
+SGD_PEAK_LR = 1e-4          # SGD峰值学习率  
+SGD_DECAY_LR = 5e-6         # SGD最终学习率 (更低的最终学习率，让后期更精细)
+SGD_MOMENTUM = 0.95         # SGD动量 (更高动量，后期更稳定)
 SGD_NESTEROV = True         # 是否使用Nesterov
-SGD_CLIP_NORM = 2.0         # SGD梯度裁剪 (控制grad_norm)
+SGD_CLIP_NORM = 2.5        # SGD梯度裁剪 (后期更严格的裁剪，保持稳定)
 
 # AdamW配置
 ADAMW_PEAK_LR = 5e-5        # AdamW峰值学习率 (比SGD低)
@@ -853,6 +853,7 @@ def patch_checkpoint_save_with_memory_cleanup():
 
     # 保存原始函数
     original_save_state = _checkpoints.save_state
+    original_restore_state = _checkpoints.restore_state
 
     def memory_safe_save_state(checkpoint_manager, state, data_loader, step):
         """内存安全的保存状态函数 - 增强版，包含临时目录清理"""
