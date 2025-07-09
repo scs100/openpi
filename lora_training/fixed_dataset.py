@@ -162,18 +162,30 @@ class FixedDataset:
         
         # 处理图像
         images = {}
+
+        # 定义图像字段映射关系
         image_name_mapping = {
+            # 如果parquet中是observation.images.xxx格式
             'exterior_image_1_left': 'base_0_rgb',
             'wrist_image_left': 'left_wrist_0_rgb',
-            'wrist_image_right': 'right_wrist_0_rgb'
+            'wrist_image_right': 'right_wrist_0_rgb',
+            # 如果parquet中已经是OpenPI格式
+            'base_0_rgb': 'base_0_rgb',
+            'left_wrist_0_rgb': 'left_wrist_0_rgb',
+            'right_wrist_0_rgb': 'right_wrist_0_rgb'
         }
-        
+
         for key, value in current_sample.items():
+            # 处理observation.images.xxx格式
             if key.startswith("observation.images."):
                 img_name = key.replace("observation.images.", "")
                 img_array = self._process_image(value)
                 mapped_name = image_name_mapping.get(img_name, img_name)
                 images[mapped_name] = img_array
+            # 处理直接的OpenPI格式 (如base_0_rgb)
+            elif key in image_name_mapping:
+                img_array = self._process_image(value)
+                images[key] = img_array
         
         # 处理状态 (14维 -> 32维)
         try:
