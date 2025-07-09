@@ -36,21 +36,36 @@ plt.rcParams['font.size'] = 9
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def decode_image(img_bytes):
+def decode_image(img_bytes, convert_bgr_to_rgb=False):
+    """解码图像数据
+
+    Args:
+        img_bytes: 图像字节数据
+        convert_bgr_to_rgb: 是否将BGR转换为RGB（如果原始数据是BGR格式）
+
+    Returns:
+        归一化到[-1,1]的float32图像数组
+    """
     img = Image.open(io.BytesIO(img_bytes))
     img_array = np.array(img, dtype=np.float32) / 255.0
+
+    # 如果需要BGR到RGB转换
+    if convert_bgr_to_rgb:
+        img_array = img_array[:, :, ::-1]  # 反转颜色通道顺序
+
     return img_array * 2.0 - 1.0  # 归一化到[-1,1]
 
 class FullEpisodeInferenceVisualizer:
     """Full episode inference visualizer"""
     
-    def __init__(self, host="localhost", port=8000, data_path="/home/q/data/pick_and_place_eggplant/openpi", debug=False, prediction_step=0):
+    def __init__(self, host="localhost", port=8000, data_path="/home/q/data/pick_and_place_eggplant/openpi", debug=False, prediction_step=0, convert_bgr_to_rgb=False):
         self.host = host
         self.port = port
         self.data_path = Path(data_path)
         self.policy = None
         self.gt_data = None
         self.debug = debug
+        self.convert_bgr_to_rgb = convert_bgr_to_rgb  # 是否将BGR转换为RGB
         # 统一控制选择哪一步预测进行对比和可视化
         # 0: 第一步, -1: 最后一步, 其他: 指定步数
         self.prediction_step = prediction_step
@@ -117,7 +132,7 @@ class FullEpisodeInferenceVisualizer:
                     logger.info(f"列名: {list(df.columns)}")
                     
                     # 检查相机列
-                    camera_cols = [col for col in df.columns if 'image' in col.lower()]
+                    camera_cols = [col for col in df.columns if 'image' in col.lower() or 'rgb' in col.lower()]
                     logger.info(f"可能的相机列: {camera_cols}")
                     
                     # 检查状态向量维度
@@ -130,7 +145,7 @@ class FullEpisodeInferenceVisualizer:
                 states = np.array([np.array(state)[:14] for state in df['observation.state']])
                 
                 # 收集图像数据（如果存在）
-                image_columns = [col for col in df.columns if 'image' in col.lower()]
+                image_columns = [col for col in df.columns if 'image' in col.lower() or 'rgb' in col.lower()]
                 
                 # 存储列名到数据字典中，用于后续格式确定
                 column_names = list(df.columns)
@@ -203,11 +218,14 @@ class FullEpisodeInferenceVisualizer:
             mask[0, :length] = True
             return result, mask
         
-        # 定义映射关系
+        # 定义映射关系 - 映射到PI0模型期望的相机名称
         image_key_map = {
             "exterior_image_1_left": "base_0_rgb",
             "wrist_image_left": "left_wrist_0_rgb",
-            "wrist_image_right": "right_wrist_0_rgb"
+            "wrist_image_right": "right_wrist_0_rgb",
+            "base_0_rgb": "base_0_rgb",  
+            "left_wrist_0_rgb": "left_wrist_0_rgb",
+            "right_wrist_0_rgb": "right_wrist_0_rgb",
         }
         
         for step_idx in range(max_steps):
@@ -233,7 +251,7 @@ class FullEpisodeInferenceVisualizer:
                         if img_data is not None:
                             mapped_key = image_key_map.get(cam_name, cam_name)
                             if isinstance(img_data, dict) and 'bytes' in img_data:
-                                images[mapped_key] = decode_image(img_data['bytes'])
+                                images[mapped_key] = decode_image(img_data['bytes'], self.convert_bgr_to_rgb)
                                 # # debug，用PIL保存图片查看是否正常
                                 if self.debug and step_idx < 3:  # 只保存前3步的图片
                                     # 将[-1,1]的float32转换回[0,255]的uint8格式用于保存
@@ -243,7 +261,7 @@ class FullEpisodeInferenceVisualizer:
                                     debug_img.save(debug_path)
                                     logger.info(f"Debug: 保存图片到 {debug_path}, 形状: {images[mapped_key].shape}")
                             elif isinstance(img_data, bytes):
-                                images[mapped_key] = decode_image(img_data)
+                                images[mapped_key] = decode_image(img_data, self.convert_bgr_to_rgb)
                                 # # debug，用PIL保存图片查看是否正常
                                 if self.debug and step_idx < 3:  # 只保存前3步的图片
                                     # 将[-1,1]的float32转换回[0,255]的uint8格式用于保存
@@ -254,6 +272,15 @@ class FullEpisodeInferenceVisualizer:
                                     logger.info(f"Debug: 保存图片到 {debug_path}, 形状: {images[mapped_key].shape}")
                             else:
                                 images[mapped_key] = img_data
+
+                # 如果没有图像数据，创建占位符图像以满足PI0模型要求
+                if not images:
+                    logger.warning("没有找到图像数据，创建占位符图像")
+                    # 创建一个黑色占位符图像 (480, 640, 3) 格式，值范围[-1, 1]
+                    placeholder_image = np.zeros((480, 640, 3), dtype=np.float32)
+                    images = {
+                        "base_0_rgb": placeholder_image,  # PI0模型要求的基础图像
+                    }
 
                 # --- 新增详细日志 ---
                 if self.debug:
@@ -268,7 +295,7 @@ class FullEpisodeInferenceVisualizer:
                     tokenized_prompt_mask = np.ones((1, 48), dtype=bool)
                 obs = {
                     "state": padded_state,
-                    "image": images,
+                    "image": images,  # PI0模型期望 "image" 键（单数）
                     "prompt": prompt_text,
                     "tokenized_prompt": tokens,
                     "tokenized_prompt_mask": tokenized_prompt_mask
@@ -437,13 +464,19 @@ class FullEpisodeInferenceVisualizer:
                 gt_values = gt_states[:, 0, joint_idx]
                 pred_values = pred_states[:, 0, joint_idx]
 
-                ax.plot(steps, gt_values, color='royalblue', linewidth=2.5, label='Ground Truth')
-                ax.plot(steps, pred_values, color='orangered', linewidth=2.5, label='Prediction', linestyle='--')
+                # 每3步画一个点，并用折线连接
+                step_indices = np.arange(0, len(steps), 3)  # 每3步取一个点
+                gt_sampled = gt_values[step_indices]
+                pred_sampled = pred_values[step_indices]
+                steps_sampled = steps[step_indices]
 
-                mse = np.mean((pred_values - gt_values) ** 2)
-                mae = np.mean(np.abs(pred_values - gt_values))
-                if np.std(gt_values) > 1e-6:
-                    corr = np.corrcoef(gt_values, pred_values)[0, 1]
+                ax.plot(steps_sampled, gt_sampled, color='royalblue', linewidth=2.5, label='Ground Truth', marker='o', markersize=4)
+                ax.plot(steps_sampled, pred_sampled, color='orangered', linewidth=2.5, label='Prediction', linestyle='--', marker='s', markersize=4)
+
+                mse = np.mean((pred_sampled - gt_sampled) ** 2)
+                mae = np.mean(np.abs(pred_sampled - gt_sampled))
+                if np.std(gt_sampled) > 1e-6:
+                    corr = np.corrcoef(gt_sampled, pred_sampled)[0, 1]
                     corr_text = f'{corr:.3f}'
                 else:
                     corr_text = 'N/A'
@@ -504,7 +537,7 @@ class FullEpisodeInferenceVisualizer:
             ax.plot(range(len(gt_full)), gt_full, color='black', linewidth=3, label='Ground Truth', alpha=0.8)
 
             # 绘制每个时刻的预测轨迹
-            for t_idx in range(0, max_timesteps, 10):  # 每10步画一条轨迹
+            for t_idx in range(0, max_timesteps, 10):  # 每3步画一条轨迹
                 color = colors[t_idx % len(colors)]
 
                 # 获取在时刻t_idx的预测轨迹（未来prediction_horizon步）
@@ -606,10 +639,10 @@ def main():
     """
 conda activate openpi && python inference_piper/inference_with_dis_openloop.py \
   --host localhost --port 8000 \
-  --data_path /home/testuser/data/pick_and_place_eggplant/openpi_33fps \
-  --episode 0 --step_limit 200 --output my_infer.png \
+  --data_path /home/testuser/data/simple/openpi \
+  --episode 10 --step_limit 400 --output inference_result/simple_3w_pred29.png \
   --future_steps 50 --prediction_step 29    \
-  --multi_step_plot  --max_timesteps 200 --prediction_horizon 50
+  --multi_step_plot  --max_timesteps 400 --prediction_horizon 50
       """
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="OpenPI完整剧集推理可视化（带扰动）")
@@ -628,6 +661,8 @@ conda activate openpi && python inference_piper/inference_with_dis_openloop.py \
                         help="允许的最大连续错误数，超过此数值将中止处理")
     parser.add_argument("--debug", action="store_true",
                         help="启用调试模式，打印更多信息")
+    parser.add_argument("--convert_bgr_to_rgb", "--conv",action="store_true",
+                        help="将BGR图像转换为RGB（如果调试图片颜色异常则启用此选项）")
     parser.add_argument("--future_steps", type=int, default=30,
                         help="要预测的未来步骤数量")
     parser.add_argument("--prediction_step", type=int, default=0,
@@ -648,7 +683,8 @@ conda activate openpi && python inference_piper/inference_with_dis_openloop.py \
             port=args.port,
             data_path=args.data_path,
             debug=args.debug,
-            prediction_step=args.prediction_step
+            prediction_step=args.prediction_step,
+            convert_bgr_to_rgb=args.convert_bgr_to_rgb
         )
         # 连接服务器
         if not visualizer.connect_to_server():

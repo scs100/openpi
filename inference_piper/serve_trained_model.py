@@ -100,11 +100,11 @@ def create_policy(model_config: TrainedModelConfig):
 # 所有主要参数都是必需的
 conda activate openpi;
 python inference_piper/serve_trained_model.py \
-     --checkpoint_dir checkpoints/lora_training/lora_sgd_bat6_10w_lr1e-4/16000 \
+     --checkpoint_dir checkpoints/lora_training/lora_sgd_bat6_10w_lr1e-41e5/30000 \
      --config_name lora_training \
      --default_prompt "pick the long eggplant and place on the plant" \
-     --dataset_name "pick_and_place_eggplant_33fps" \
-     --data_path "/home/testuser/data/pick_and_place_eggplant/openpi_33fps" \
+     --dataset_name "pick_and_place_eggplant_simle" \
+     --data_path "/home/testuser/data/simple/openpi" \
      --port 8000 \
      --host 0.0.0.0
 
