@@ -23,13 +23,7 @@ from xRocs.xrocs.core.station_loader import StationLoader
 from xRocs.xrocs.core.config_loader import ConfigLoader
 from xRocs.xrocs.common.data_type import Joints
 
-# 图像解码函数（从OpenPI推理脚本移植）
-def decode_image(img_bytes):
-    """解码图像字节数据为numpy数组"""
-    from PIL import Image
-    import io
-    img = Image.open(io.BytesIO(img_bytes))
-    return np.array(img)
+
 
 # 导入推理相关模块 - 替换为OpenPI推理
 try:
@@ -170,119 +164,6 @@ class FileDataBuffer:
             'fps': self.frame_count / runtime if runtime > 0 else 0
         }
 
-    def _init_ros_node(self):
-        """初始化ROS节点"""
-        try:
-            # 检查是否已经初始化了ROS节点
-            if not rospy.get_node_uri():
-                rospy.init_node('openpi_data_reader', anonymous=True)
-                print("✅ ROS节点初始化成功")
-            else:
-                print("ℹ️  ROS节点已存在，跳过初始化")
-        except Exception as e:
-            print(f"⚠️  ROS节点初始化失败: {e}")
-
-    def _setup_subscribers(self):
-        """设置ROS订阅者"""
-        # 关节数据订阅者
-        joint_topics = {
-            'left': '/puppet/joint_left',
-            'right': '/puppet/joint_right'
-        }
-
-        for arm_name, topic in joint_topics.items():
-            try:
-                self.joint_subscribers[arm_name] = rospy.Subscriber(
-                    topic, JointState,
-                    lambda msg, arm=arm_name: self._joint_callback(msg, arm),
-                    queue_size=1
-                )
-                print(f"✅ 订阅关节话题: {topic}")
-            except Exception as e:
-                print(f"❌ 订阅关节话题失败 {topic}: {e}")
-
-        # 图像数据订阅者
-        image_topics = {
-            'left': '/camera_l/color/image_raw',
-            'right': '/camera_r/color/image_raw',
-            'front': '/camera_f/color/image_raw'
-        }
-
-        for cam_name, topic in image_topics.items():
-            try:
-                self.image_subscribers[cam_name] = rospy.Subscriber(
-                    topic, Image,
-                    lambda msg, cam=cam_name: self._image_callback(msg, cam),
-                    queue_size=1
-                )
-                print(f"✅ 订阅图像话题: {topic}")
-            except Exception as e:
-                print(f"❌ 订阅图像话题失败 {topic}: {e}")
-
-    def _joint_callback(self, msg, arm_name):
-        """关节数据回调函数 - 保存到缓冲区和最新数据"""
-        try:
-            current_time = time.time()
-            joint_array = np.array(msg.position, dtype=np.float32)
-
-            with self.data_lock:
-                # 保存到缓冲区（带时间戳）
-                self.joint_buffer[arm_name].append({
-                    'timestamp': current_time,
-                    'data': joint_array
-                })
-
-                # 更新最新数据（快速访问）
-                self.latest_joint_data[arm_name] = joint_array
-
-        except Exception as e:
-            print(f"⚠️  关节数据回调错误 {arm_name}: {e}")
-
-    def _image_callback(self, msg, cam_name):
-        """图像数据回调函数 - 保存到缓冲区和最新数据"""
-        try:
-            current_time = time.time()
-
-            # 使用cv_bridge转换图像
-            bridge = CvBridge()
-            cv_image = bridge.imgmsg_to_cv2(msg, "bgr8")
-
-            # 转换为RGB并调整大小
-            rgb_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
-            target_size = self.target_sizes.get(cam_name, (128, 128))
-            resized_image = cv2.resize(rgb_image, target_size)
-
-            with self.data_lock:
-                # 保存到缓冲区（带时间戳）
-                self.image_buffer[cam_name].append({
-                    'timestamp': current_time,
-                    'data': resized_image
-                })
-
-                # 更新最新数据（快速访问）
-                self.latest_image_data[cam_name] = resized_image
-
-        except Exception as e:
-            print(f"⚠️  图像数据回调错误 {cam_name}: {e}")
-
-    def _wait_for_initial_data(self):
-        """等待初始数据"""
-        print("⏳ 等待ROS订阅者接收初始数据...")
-
-        for i in range(20):  # 最多等待10秒
-            with self.data_lock:
-                joints_ready = len(self.joint_data) >= 2
-                images_ready = len(self.image_data) >= 1
-
-                if joints_ready and images_ready:
-                    print("✅ 初始数据准备就绪")
-                    return
-
-            time.sleep(0.5)
-            print(f"   等待中... ({i+1}/20) - 关节: {len(self.joint_data)}/2, 图像: {len(self.image_data)}/3")
-
-        print("⚠️  初始数据等待超时，继续运行...")
-
     def get_obs(self):
         """获取观测数据 - 直接从缓存读取，极快速度"""
         obs_start_time = time.time()
@@ -366,228 +247,13 @@ class FileDataBuffer:
             self.image_saver_process = None
             self.image_save_dir = None
 
-    def _start_background_update(self):
-        """启动后台数据更新线程"""
-        print("🔧 启动后台数据更新线程...")
-        self.update_thread = threading.Thread(target=self._background_update_loop, daemon=True)
-        self.update_thread.start()
 
-    def _background_update_loop(self):
-        """后台数据更新循环 - 只在初始化时获取一次图像用于调试"""
-        initial_updates = 0
-        max_initial_updates = 1  # 只在开始时更新一次
 
-        while self.running:
-            try:
-                start_time = time.perf_counter()
 
-                # 初始化阶段：只获取一次图像用于调试，然后停止图像更新
-                if initial_updates < max_initial_updates:
-                    # 更新关节数据
-                    joint_data = self._fetch_joint_data()
-                    # 只在第一次更新图像数据用于调试
-                    print("🔄 初始化阶段：获取一次图像数据用于调试...")
-                    image_data = self._fetch_image_data()
 
-                    # 更新缓存
-                    with self.data_lock:
-                        if joint_data:
-                            self.cached_joint_data.update(joint_data)
-                        if image_data:
-                            self.cached_image_data.update(image_data)
-                        self.last_update_time = time.time()
 
-                    elapsed = time.perf_counter() - start_time
-                    print(f"🔄 初始化更新完成: {elapsed*1000:.1f}ms")
-                    print("ℹ️  后续推理将使用实时图像获取，不再保存图像文件")
-                    initial_updates += 1
 
-                    # 初始化阶段更新间隔短一些
-                    time.sleep(0.5)
-                else:
-                    # 初始化完成后：只做轻量级更新，主要依赖实时获取
-                    # 偶尔更新关节数据以保持连接活跃
-                    if time.time() - self.last_update_time > 5.0:  # 每5秒更新一次
-                        joint_data = self._fetch_joint_data()
-                        with self.data_lock:
-                            if joint_data:
-                                self.cached_joint_data.update(joint_data)
-                            self.last_update_time = time.time()
 
-                    # 长间隔等待
-                    time.sleep(5.0)
-
-            except Exception as e:
-                print(f"❌ 后台更新错误: {e}")
-                time.sleep(1.0)
-
-    def _fetch_joint_data(self):
-        """获取关节数据（后台调用）"""
-        joint_data = {}
-
-        for arm_name in ['left', 'right']:
-            topic = f'/puppet/joint_{arm_name}'
-
-            try:
-                import subprocess
-                # 大幅减少超时时间：从1秒减少到0.2秒
-                cmd = ['timeout', '0.2', 'rostopic', 'echo', topic, '-n', '1', '--noarr']
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=0.3)
-
-                if result.returncode == 0 and result.stdout.strip():
-                    import yaml
-                    yaml_content = result.stdout.split('---')[0].strip()
-                    data = yaml.safe_load(yaml_content)
-
-                    if data and 'position' in data:
-                        joints = np.array(data['position'], dtype=np.float32)
-                        joint_data[arm_name] = joints
-
-            except Exception:
-                pass  # 忽略错误，保持后台运行
-
-        return joint_data
-
-    def _fetch_image_data(self):
-        """获取真实多相机图像数据（使用验证有效的方法）"""
-        image_data = {}
-
-        # 相机话题映射
-        camera_topics = {
-            'left': '/camera_l/color/image_raw',
-            'right': '/camera_r/color/image_raw',
-            'front': '/camera_f/color/image_raw'
-        }
-
-        # 使用验证有效的方法：指定文件名的image_saver
-        for cam_name, topic in camera_topics.items():
-            try:
-                import subprocess
-                import os
-
-                # 使用固定的临时文件路径
-                temp_file = f'/tmp/real_cam_{cam_name}.jpg'
-
-                # 删除旧文件
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-
-                # 使用验证有效的命令（方法2）
-                cmd = f'timeout 2 rosrun image_view image_saver image:={topic} _filename_format:={temp_file}'
-
-                # 执行命令
-                result = subprocess.run(cmd, shell=True, cwd='/tmp', capture_output=True, text=True, timeout=3)
-
-                # 检查是否保存了图像
-                if os.path.exists(temp_file):
-                    # 读取真实图像
-                    real_img = cv2.imread(temp_file)
-                    if real_img is not None:
-                        # resize到224x224
-                        resized_img = cv2.resize(real_img, (224, 224))
-                        # 转换为RGB格式
-                        rgb_img = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
-                        image_data[cam_name] = rgb_img
-
-                        if self.frame_count % 10 == 0:
-                            print(f"✅ 获取真实{cam_name}相机图像: {rgb_img.shape}")
-                    else:
-                        print(f"❌ 无法读取{cam_name}相机图像文件")
-
-                    # 清理临时文件
-                    try:
-                        os.remove(temp_file)
-                    except:
-                        pass
-                else:
-                    print(f"❌ {cam_name}相机图像未保存到 {temp_file}")
-
-            except Exception as e:
-                print(f"❌ 获取{cam_name}相机图像失败: {e}")
-
-        return image_data
-
-    def _fetch_image_data_fast(self):
-        """快速获取图像数据 - 用于推理过程中的实时获取，不保存文件"""
-        image_data = {}
-
-        # 相机话题映射
-        camera_topics = {
-            'left': '/camera_l/color/image_raw',
-            'right': '/camera_r/color/image_raw',
-            'front': '/camera_f/color/image_raw'
-        }
-
-        # 使用 rostopic echo 直接获取图像数据（更快的方法）
-        for cam_name, topic in camera_topics.items():
-            try:
-                import subprocess
-
-                # 使用 rostopic echo 获取一帧图像数据（大幅减少超时时间）
-                cmd = ['timeout', '0.1', 'rostopic', 'echo', topic, '-n', '1', '--noarr']
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=0.2)
-
-                if result.returncode == 0 and result.stdout.strip():
-                    # 解析ROS图像消息头信息
-                    if self.frame_count % 20 == 0:  # 减少打印频率
-                        print(f"📷 {cam_name}相机话题有数据")
-
-                    # 创建占位图像（等待实现真实图像解析）
-                    # TODO: 实现真实的ROS图像消息解析
-                    placeholder_img = np.zeros((128, 128, 3), dtype=np.uint8)
-                    image_data[cam_name] = placeholder_img
-                else:
-                    # 如果无法获取数据，跳过这个相机
-                    if self.frame_count % 20 == 0:
-                        print(f"⚠️  {cam_name}相机无数据")
-
-            except Exception as e:
-                # 出错时跳过这个相机，不使用模拟数据
-                if self.frame_count % 20 == 0:
-                    print(f"⚠️  {cam_name}相机获取失败: {e}")
-
-        return image_data
-
-    def _wait_for_initial_data(self):
-        """等待初始数据"""
-        print("⏳ 等待初始数据...")
-
-        for i in range(10):  # 最多等待 5 秒
-            with self.data_lock:
-                if len(self.cached_joint_data) >= 2 and len(self.cached_image_data) >= 1:
-                    print("✅ 初始数据准备就绪")
-                    return
-
-            time.sleep(0.5)
-
-        print("⚠️  初始数据等待超时，继续运行...")
-
-    def get_obs(self):
-        """获取观测数据 - 实时获取关节数据和快速图像数据"""
-        obs_start_time = time.time()
-
-        # 实时获取关节数据
-        joint_start_time = time.time()
-        joint_data = self._fetch_joint_data()
-        joint_time = (time.time() - joint_start_time) * 1000
-
-        # 快速获取图像数据（不保存文件）
-        image_start_time = time.time()
-        image_data = self._fetch_image_data_fast()
-        image_time = (time.time() - image_start_time) * 1000
-
-        # 更新帧计数
-        self.frame_count += 1
-
-        obs = {
-            'arm_joints': joint_data if joint_data else self.cached_joint_data.copy(),
-            'images': image_data if image_data else self.cached_image_data.copy()
-        }
-
-        total_obs_time = (time.time() - obs_start_time) * 1000
-        print(f"📊 观测数据详情 - 关节: {joint_time:.1f}ms, 图像: {image_time:.1f}ms, 总计: {total_obs_time:.1f}ms")
-
-        return obs
 
     def is_data_ready(self):
         """检查数据是否准备就绪"""
@@ -704,14 +370,13 @@ class PolicyInference:
                         # 假设输入已经是RGB格式
                         pass
                 else:
-                    # 如果是编码格式，解码并转换
-                    cam_img = cv2.imdecode(cam_img, cv2.IMREAD_COLOR)
-                    cam_img = cv2.cvtColor(cam_img, cv2.COLOR_BGR2RGB)
-                    cam_img = cv2.resize(cam_img, dsize=(224, 224))
+                    # 如果不是numpy数组格式，直接报错
+                    raise ValueError(f"图像数据格式错误，期望numpy数组，实际得到: {type(cam_img)}, shape: {getattr(cam_img, 'shape', 'N/A')}")
+                   
 
                 # 使用OpenPI期望的相机名称
                 images[mapped_key] = cam_img
-
+                
                 print(f"📷 处理 {cam_name} -> {mapped_key} 图像: {cam_img.shape}")
             else:
                 print(f"⚠️  缺少 {cam_name} 相机数据")
@@ -1061,81 +726,7 @@ class JointInference:
             print(f"⚠️  数据准备状态检查失败: {e}")
             return False
 
-    def _fetch_joint_data(self):
-        """获取关节数据（优化超时时间）"""
-        joint_data = {}
 
-        for arm_name in ['left', 'right']:
-            topic = f'/puppet/joint_{arm_name}'
-
-            try:
-                import subprocess
-                # 减少超时时间
-                cmd = ['timeout', '0.5', 'rostopic', 'echo', topic, '-n', '1', '--noarr']
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1.0)
-
-                if result.returncode == 0 and result.stdout.strip():
-                    import yaml
-                    yaml_content = result.stdout.split('---')[0].strip()
-                    data = yaml.safe_load(yaml_content)
-
-                    if data and 'position' in data:
-                        joints = np.array(data['position'], dtype=np.float32)
-                        joint_data[arm_name] = joints
-
-            except Exception:
-                pass  # 忽略错误，保持运行
-
-        # 如果没有获取到真实数据，使用模拟数据进行测试
-        if not joint_data:
-            print("⚠️  未获取到真实关节数据，使用模拟数据进行测试")
-            joint_data = {
-                'left': np.random.uniform(-1, 1, 7).astype(np.float32),
-                'right': np.random.uniform(-1, 1, 7).astype(np.float32)
-            }
-
-        return joint_data
-
-    def _fetch_image_data_fast(self):
-        """快速获取图像数据 - 用于推理过程中的实时获取，不保存文件"""
-        image_data = {}
-
-        # 相机话题映射
-        camera_topics = {
-            'left': '/camera_l/color/image_raw',
-            'right': '/camera_r/color/image_raw',
-            'front': '/camera_f/color/image_raw'
-        }
-
-        # 使用 rostopic echo 直接获取图像数据（更快的方法）
-        for cam_name, topic in camera_topics.items():
-            try:
-                import subprocess
-
-                # 使用 rostopic echo 获取一帧图像数据（大幅减少超时时间）
-                cmd = ['timeout', '0.1', 'rostopic', 'echo', topic, '-n', '1', '--noarr']
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=0.2)
-
-                if result.returncode == 0 and result.stdout.strip():
-                    # 解析ROS图像消息头信息
-                    if hasattr(self, 'frame_count') and self.frame_count % 20 == 0:  # 减少打印频率
-                        print(f"📷 {cam_name}相机话题有数据")
-
-                    # 真实部署：必须解析真实的ROS图像数据
-                    print(f"❌ {cam_name}相机数据解析未实现，需要实现真实图像解析")
-                    # 暂时跳过这个相机，不返回None（这会导致整个函数返回None）
-                    continue
-                else:
-                    # 如果无法获取数据，跳过这个相机
-                    if hasattr(self, 'frame_count') and self.frame_count % 20 == 0:
-                        print(f"⚠️  {cam_name}相机无数据")
-
-            except Exception as e:
-                # 出错时跳过这个相机，不使用模拟数据
-                if hasattr(self, 'frame_count') and self.frame_count % 20 == 0:
-                    print(f"⚠️  {cam_name}相机获取失败: {e}")
-
-        return image_data
 
     def _monitor_joint_changes(self, current_joints):
         """监控关节状态变化"""
@@ -1463,6 +1054,17 @@ mode2: {mode2}" --once'''
             print("❌ 观测数据源未准备就绪")
             return
 
+        # 在开始推理之前，先让机械臂回到home状态
+        print("🏠 推理前准备：机械臂回到home位置...")
+        try:
+            if self.prepare():
+                print("✅ 机械臂已回到home位置，准备开始推理")
+            else:
+                print("⚠️  机械臂回home失败，但继续推理")
+        except Exception as e:
+            print(f"⚠️  机械臂回home过程中出错: {e}")
+            print("⚠️  继续推理，但可能影响初始状态")
+
         try:
             print("📊 开始推理循环...")
             step_count = 0
@@ -1623,102 +1225,4 @@ mode2: {mode2}" --once'''
             traceback.print_exc()
 
 
-if __name__ == '__main__':
-    print("🚀 开始 Agilex 机械臂控制和OpenPI推理测试...")
 
-    config_path = '/home/agilex/code/opensource/openpi/agilex_eggplant_config.toml'
-    # OpenPI推理服务器配置
-    openpi_host = "localhost"
-    openpi_port = 8000
-
-    try:
-        print("🔧 创建 JointInference 实例...")
-        data = JointInference(config_path, host=openpi_host, port=openpi_port)
-
-        print("🏠 测试 prepare 方法...")
-        data.prepare()
-
-        print("🎉 prepare 方法测试成功!")
-
-        # 测试关节控制功能
-        print("🤖 测试关节控制功能...")
-
-        # 测试使能
-        if data.enable_robot():
-            print("✅ 机械臂使能测试成功")
-        else:
-            print("❌ 机械臂使能测试失败")
-
-        # 测试关节控制
-        test_left_joints = [-0.2, 0.1, 0.0, -0.5, -0.3, 0.5, 0.0003]
-        test_right_joints = [0.2, 0.1, 0.0, -0.5, 0.3, 0.5, 0.0005]
-
-        print("🎯 测试左臂关节控制...")
-        if data.send_joint_command('left', test_left_joints):
-            print("✅ 左臂关节控制测试成功")
-        else:
-            print("❌ 左臂关节控制测试失败")
-
-        time.sleep(2)
-
-        print("🎯 测试右臂关节控制...")
-        if data.send_joint_command('right', test_right_joints):
-            print("✅ 右臂关节控制测试成功")
-        else:
-            print("❌ 右臂关节控制测试失败")
-
-        time.sleep(2)
-
-        # 回到home位置
-        print("🏠 回到home位置...")
-        data.prepare()
-
-        # 测试观测数据获取
-        print("📊 测试观测数据获取...")
-        if data.is_data_ready():
-            print("✅ 数据源准备就绪")
-            obs = data.get_obs()
-            if obs is not None:
-                print(f"📊 观测数据获取成功:")
-                print(f"  - 关节数据键: {list(obs.get('arm_joints', {}).keys())}")
-                print(f"  - 图像数据键: {list(obs.get('images', {}).keys())}")
-
-                # 显示关节数据详情
-                for arm_name, joints in obs.get('arm_joints', {}).items():
-                    if isinstance(joints, np.ndarray):
-                        print(f"  - {arm_name} 关节: {joints.shape} 个关节")
-                    else:
-                        print(f"  - {arm_name} 关节: {type(joints)}")
-
-                # 显示图像数据详情
-                for cam_name, img_data in obs.get('images', {}).items():
-                    if isinstance(img_data, np.ndarray):
-                        print(f"  - {cam_name} 图像: {img_data.shape} 字节")
-                    else:
-                        print(f"  - {cam_name} 图像: {type(img_data)}")
-            else:
-                print("❌ 观测数据获取失败")
-        else:
-            print("⚠️  数据源未准备就绪，等待数据...")
-            time.sleep(2)
-            if data.is_data_ready():
-                print("✅ 数据源现在准备就绪")
-                obs = data.get_obs()
-                if obs is not None:
-                    print("📊 观测数据获取成功!")
-                else:
-                    print("❌ 观测数据获取失败")
-            else:
-                print("❌ 数据源仍未准备就绪")
-
-        # 如果有OpenPI推理引擎，可以测试推理功能
-        if data.inference_engine is not None:
-            print("🤖 开始测试OpenPI推理功能...")
-            data.inference('/home/agilex/data/example_dir', "example_task")
-        else:
-            print("ℹ️  OpenPI推理引擎未初始化，跳过推理测试")
-
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()

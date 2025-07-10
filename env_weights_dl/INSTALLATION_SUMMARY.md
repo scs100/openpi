@@ -4,7 +4,7 @@
 ✅ **安装成功完成！**
 
 ## 环境信息
-- **项目路径**: `/home/testuser/code/opensource/openpi`
+- **项目路径**: `/home/agilex/code/opensource/openpi`
 - **Conda 环境**: `openpi`
 - **Python 版本**: 3.11.13
 - **操作系统**: Ubuntu 22.04
@@ -61,14 +61,14 @@
 
 ### 1. 运行推理示例
 ```bash
-cd /home/testuser/code/opensource/openpi
+cd /home/agilex/code/opensource/openpi
 conda activate openpi
 jupyter notebook examples/inference.ipynb
 ```
 
 ### 2. 测试简单客户端
 ```bash
-cd /home/testuser/code/opensource/openpi
+cd /home/agilex/code/opensource/openpi
 conda activate openpi
 python examples/simple_client/main.py --env droid --num_steps 5
 ```
@@ -86,7 +86,7 @@ python examples/simple_client/main.py --env droid --num_steps 5
 
 ### 如果遇到依赖冲突
 ```bash
-cd /home/testuser/code/opensource/openpi
+cd /home/agilex/code/opensource/openpi
 conda activate openpi
 rm -rf .venv
 GIT_LFS_SKIP_SMUDGE=1 uv sync --index-url https://pypi.tuna.tsinghua.edu.cn/simple
@@ -113,7 +113,7 @@ export OPENPI_DATA_HOME=/path/to/custom/cache
 ## 验证命令
 运行以下命令验证安装：
 ```bash
-cd /home/testuser/code/opensource/openpi
+cd /home/agilex/code/opensource/openpi
 conda activate openpi
 python test_installation.py
 ```

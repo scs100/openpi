@@ -102,7 +102,7 @@ class EggplantDataset:
 @dataclasses.dataclass(frozen=True)
 class EggplantDataConfig(_config.DataConfigFactory):
     """茄子数据配置工厂 - 智能适配真实数据或假数据"""
-    data_path: str = "/home/testuser/data/pick_and_place_eggplant/openpi"
+    data_path: str = "/home/agilex/data/pick_and_place_eggplant/openpi"
     default_prompt: str = "pick and place purple long eggplant"
 
     def create(self, assets_dirs, model_config):
