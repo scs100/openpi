@@ -32,6 +32,7 @@ class FixedDataset:
         print(f"  - 总样本数: {len(self.file_index)}")
         print(f"  - 数据fps: {self.data_fps}")
         print(f"  - 动作序列长度: {self.action_horizon}")
+        print(f"  - 返回绝对关节角，delta转换由OpenPI transforms处理")
         print(f"  - 不进行帧率采样，使用原始时间序列")
 
     def _read_dataset_fps(self) -> float:
@@ -109,8 +110,8 @@ class FixedDataset:
             # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             # cv2.imwrite(f"debugnocvt.jpg", img)
             # import pdb; pdb.set_trace()
-            # 调整大小到224x224
-            img = cv2.resize(img, (224, 224))
+            # 使用resize_with_pad保持宽高比
+            # img = self._resize_with_pad(img, 224, 224)
 
             # 归一化到[-1, 1]
             img_array = img.astype(np.float32) / 255.0
@@ -122,12 +123,40 @@ class FixedDataset:
             print(f"⚠️ 图像处理失败: {e}")
             return np.zeros((224, 224, 3), dtype=np.float32)
 
+    def _resize_with_pad(self, img: np.ndarray, target_height: int = 224, target_width: int = 224) -> np.ndarray:
+        """使用resize_with_pad方式处理图像，保持宽高比"""
+        h, w = img.shape[:2]
+
+        # 如果已经是目标尺寸，直接返回
+        if h == target_height and w == target_width:
+            return img
+
+        # 计算缩放比例，保持宽高比
+        ratio = max(w / target_width, h / target_height)
+        new_w = int(w / ratio)
+        new_h = int(h / ratio)
+
+        # 先缩放
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        # 创建目标尺寸的黑色画布
+        result = np.zeros((target_height, target_width, img.shape[2]), dtype=img.dtype)
+
+        # 计算居中位置
+        y_offset = (target_height - new_h) // 2
+        x_offset = (target_width - new_w) // 2
+
+        # 将缩放后的图像放到画布中心
+        result[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+
+        return result
+
     def _get_action_sequence(self, episode_df: pd.DataFrame, start_idx: int) -> np.ndarray:
-        """构造连续动作序列（不进行帧率采样）"""
+        """构造连续动作序列，返回绝对关节角（delta转换由OpenPI transforms处理）"""
         actions_sequence = []
 
         for step in range(self.action_horizon):
-            # 计算目标帧索引 (从t+1时刻开始，连续50帧)
+            # 计算目标帧索引 (从t+1时刻开始，连续action_horizon帧)
             target_idx = start_idx + 1 + step
 
             # 边界处理：如果超出范围，使用最后一帧
@@ -143,6 +172,7 @@ class FixedDataset:
             except:
                 action_14d = np.zeros(14, dtype=np.float32)
 
+            # 直接返回绝对关节角，delta转换由OpenPI的DeltaActions transform处理
             # 填充到32维
             action_32d = np.zeros(32, dtype=np.float32)
             action_32d[:len(action_14d)] = action_14d
@@ -200,7 +230,7 @@ class FixedDataset:
         state_32d = np.zeros(32, dtype=np.float32)
         state_32d[:len(state_14d)] = state_14d
         
-        # 构造正确的50步动作序列
+        # 构造正确的动作序列（绝对关节角）
         actions_sequence = self._get_action_sequence(episode_df, timestep)
         
         # 创建图像mask
@@ -214,12 +244,13 @@ class FixedDataset:
             print(f"   动作序列形状: {actions_sequence.shape}")
             print(f"   动作范围: [{actions_sequence.min():.3f}, {actions_sequence.max():.3f}]")
             print(f"   状态范围: [{state_32d.min():.3f}, {state_32d.max():.3f}]")
+            print(f"   返回绝对关节角，delta转换由OpenPI处理")
         
         return {
             "image": images,
             "image_mask": image_masks,
             "state": state_32d,
-            "actions": actions_sequence,  # 正确的50步动作序列
+            "actions": actions_sequence,  # 正确的动作序列
         }
 
     def get_stats(self):
@@ -253,9 +284,9 @@ class FixedDataset:
 
 
 def create_fixed_dataset(data_path: str, default_prompt: str = "perform the task",
-                        preload_episodes: int = None):
+                        preload_episodes: int = None, use_delta_actions: bool = True):
     """创建修复版数据集"""
-    return FixedDataset(data_path, default_prompt, preload_episodes)
+    return FixedDataset(data_path, default_prompt, preload_episodes, use_delta_actions=use_delta_actions)
 
 
 if __name__ == "__main__":
@@ -288,6 +319,7 @@ if __name__ == "__main__":
 
 
 def create_fixed_dataset(data_path: str, default_prompt: str = "perform the task",
-                        preload_episodes: int = None, action_horizon: int = 50):
+                        preload_episodes: int = None, action_horizon: int = 50,
+                        use_delta_actions: bool = True):
     """创建修复版数据集"""
-    return FixedDataset(data_path, default_prompt, preload_episodes, action_horizon)
+    return FixedDataset(data_path, default_prompt, preload_episodes, action_horizon, use_delta_actions)

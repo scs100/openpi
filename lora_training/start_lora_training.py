@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-OpenPI LoRA 训练脚本 - 主动内存管理版本
+OpenPI LoRA 训练脚本 - 只训练Action Expert LoRA版本
 支持任意 LeRobot 格式数据集的 LoRA 微调训练
+
+⚠️ 重要配置说明：
+- 本脚本只训练Action Expert的LoRA参数（300M），冻结所有其他参数
+- PaliGemma 2B参数完全冻结，显著减少内存使用和训练时间
+- 图像编码器参数完全冻结
+- 只有10个LoRA参数可训练，内存效率极高
 
 配置修改说明：
 - 修改训练参数：调整 BATCH_SIZE, NUM_TRAIN_STEPS 等常量
@@ -9,7 +15,6 @@ OpenPI LoRA 训练脚本 - 主动内存管理版本
 - 修改内存设置：调整 GPU_MEM_FRACTION, SWAP_THRESHOLD 等常量
 - 修改数据路径：调整 DATASET_PATH 常量
 - 修改实验名称：调整 EXPERIMENT_NAME, WANDB_PROJECT 等常量
-- 修改训练帧率：在数据预处理阶段完成，不在训练时采样
 
 所有配置都使用常量定义，便于统一管理和修改
 """
@@ -52,14 +57,15 @@ args = parse_args()
 
 # 配置常量定义
 # 数据配置
-DATASET_PATH = "/home/testuser/data/pick_and_place_eggplant/openpi_33fps"  # 修改为您的数据集路径
-DATASET_NAME = "pick_and_place_eggplant_33fps"  # 修改为您的数据集名称
-DEFAULT_PROMPT = "pick the long eggplant and place on the plant" # 修改为您的任务描述
+DATASET_PATH = "/home/testuser/data/pass_drink/openpi"  # 修改为您的数据集路径
+DATASET_NAME = "pass_drink"  # 修改为您的数据集名称
+DEFAULT_PROMPT = "pass me the drink" # 修改为您的任务描述
+USE_DELTA_ACTIONS = True  # 使用相对关节角模式
 # 训练帧率配置 - 已废弃，现在使用数据集原始时间序列
 # TRAINING_FPS = 33.3  # ⚠️ 此参数已不再使用，帧率在数据预处理时确定
 # 实验配置
-EXPERIMENT_NAME = "lora_sgd_bat6_10w_lr1e-4"  # 修改为您的实验名称
-WANDB_PROJECT = "lora_eggplant"  # 修改为您的WandB项目名
+EXPERIMENT_NAME = "ae_lora_adamw_delta_actions_15w"  # 只训练action expert LoRA，使用相对关节角
+WANDB_PROJECT = "lora_ae_drink_delta"  # 修改为您的WandB项目名
 # WandB配置
 FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
 # 恢复训练配置 - 从命令行参数获取
@@ -67,11 +73,11 @@ RESUME_TRAINING = args.resume           # 从命令行参数获取
 OVERWRITE_CHECKPOINT = args.overwrite   # 从命令行参数获取
 
 # 优化器选择配置
-USE_ADAMW = False           # True: 使用AdamW, False: 使用SGD
+USE_ADAMW = True           # True: 使用AdamW, False: 使用SGD
 
 # 批量大小配置 - 根据优化器动态调整
-SGD_BATCH_SIZE = 6          # SGD批量大小 (已验证在RTX 4090上稳定)
-ADAMW_BATCH_SIZE = 4        # AdamW批量大小 (为额外内存需求预留空间)
+SGD_BATCH_SIZE = 12           # SGD批量大小 (优化后：更快的训练速度，更好的收敛)
+ADAMW_BATCH_SIZE = 20       # AdamW批量大小 (最佳效率点：16GB显存，2.0s/it)
 BATCH_SIZE = ADAMW_BATCH_SIZE if USE_ADAMW else SGD_BATCH_SIZE
 
 NUM_WORKERS = 0            # 预加载使用单进程即可
@@ -105,10 +111,11 @@ DECAY_LR = ADAMW_DECAY_LR if USE_ADAMW else SGD_DECAY_LR
 
 # 模型配置
 ACTION_DIM = 32             # 动作维度（必须保持32，与预训练模型匹配）
-ACTION_HORIZON = 50         # 动作序列长度
+ACTION_HORIZON = 30         # 动作序列长度
 MAX_TOKEN_LEN = 48          # 最大token长度
-PALIGEMMA_VARIANT = "gemma_2b_lora"
-ACTION_EXPERT_VARIANT = "gemma_300m_lora"
+# ⚠️ 只训练action expert的LoRA，冻结PaliGemma 2B参数
+PALIGEMMA_VARIANT = "gemma_2b"          # 不使用LoRA，完全冻结
+ACTION_EXPERT_VARIANT = "gemma_300m_lora"  # 只有这个使用LoRA训练
 
 # 内存管理配置 - 根据优化器动态调整
 SGD_GPU_MEM_FRACTION = '0.70'    # SGD GPU内存分配比例
@@ -803,7 +810,7 @@ def patch_memory_optimized_data_loader():
                 data_path=DATASET_PATH,
                 default_prompt=DEFAULT_PROMPT,
                 preload_episodes=None,  # 自动加载所有parquet文件
-                action_horizon=ACTION_HORIZON  # 从训练配置传递action_horizon
+                action_horizon=ACTION_HORIZON,  # 从训练配置传递action_horizon
             )
 
         # 其他情况使用原始函数
@@ -985,6 +992,28 @@ def log_system_memory(logger, step_name=""):
 
 
 
+def create_action_expert_only_freeze_filter():
+    """
+    创建自定义的freeze_filter，只训练action expert的LoRA参数，冻结所有其他参数
+
+    策略：
+    1. 冻结所有非LoRA参数（.*lora.*以外的所有参数）
+    2. 冻结PaliGemma 2B的LoRA参数（.*llm.*且不包含_1的LoRA参数）
+    3. 只保留action expert的LoRA参数可训练（.*llm.*_1.*lora.*）
+    """
+    import flax.nnx as nnx
+    from openpi.shared import nnx_utils
+
+    # 策略：冻结所有参数，除了action expert的LoRA参数
+    # action expert的LoRA参数路径模式：.*llm.*_1.*lora.*
+
+    # 方法1：冻结所有非action expert LoRA参数
+    # 即：冻结所有不匹配 ".*llm.*_1.*lora.*" 的参数
+    action_expert_lora_pattern = nnx_utils.PathRegex(".*llm.*_1.*lora.*")
+
+    # 返回：冻结所有不是action expert LoRA的参数
+    return nnx.Not(action_expert_lora_pattern)
+
 def safe_wandb_init(config, resuming=False):
     """安全的WandB初始化，支持网络故障容错"""
     try:
@@ -1085,7 +1114,8 @@ def create_dynamic_training_config(initial_batch_size):
         data=CustomDataConfig(
             data_path=DATASET_PATH,
             default_prompt=DEFAULT_PROMPT,
-            dataset_name=DATASET_NAME
+            dataset_name=DATASET_NAME,
+            use_delta_joint_actions=USE_DELTA_ACTIONS  # 传递相对关节角配置
         ),
 
         # 权重加载器 - 使用常量定义
@@ -1119,14 +1149,8 @@ def create_dynamic_training_config(initial_batch_size):
             nesterov=SGD_NESTEROV,
         ),
 
-        # 冻结配置 - 使用常量定义
-        freeze_filter=pi0.Pi0Config(
-            action_dim=ACTION_DIM,
-            action_horizon=ACTION_HORIZON,
-            max_token_len=MAX_TOKEN_LEN,
-            paligemma_variant=PALIGEMMA_VARIANT,
-            action_expert_variant=ACTION_EXPERT_VARIANT
-        ).get_freeze_filter(),
+        # 冻结配置 - 自定义：只训练action expert的LoRA参数，冻结所有其他参数
+        freeze_filter=create_action_expert_only_freeze_filter(),
 
         # 内存优化设置
         ema_decay=None,
@@ -1268,14 +1292,8 @@ def create_swap_managed_config():
             nesterov=SGD_NESTEROV,
         ),
 
-        # 冻结配置 - 使用常量定义
-        freeze_filter=pi0.Pi0Config(
-            action_dim=ACTION_DIM,
-            action_horizon=ACTION_HORIZON,
-            max_token_len=MAX_TOKEN_LEN,
-            paligemma_variant=PALIGEMMA_VARIANT,
-            action_expert_variant=ACTION_EXPERT_VARIANT
-        ).get_freeze_filter(),
+        # 冻结配置 - 自定义：只训练action expert的LoRA参数，冻结所有其他参数
+        freeze_filter=create_action_expert_only_freeze_filter(),
 
         # 内存优化设置
         ema_decay=None,
@@ -1320,7 +1338,8 @@ if __name__ == "__main__":
         # 调用归一化统计计算
         success = compute_norm_module.main(
             data_path=DATASET_PATH,
-            dataset_name=DATASET_NAME
+            dataset_name=DATASET_NAME,
+            use_delta_actions=USE_DELTA_ACTIONS  # 传递delta actions配置
         )
 
         if success:
