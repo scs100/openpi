@@ -16,6 +16,59 @@ sys.path.insert(0, '/home/testuser/code/opensource/openpi/src')
 
 import openpi.shared.normalize as normalize
 
+def load_dataset_with_sequences(data_path, action_horizon=30):
+    """加载数据集，构造action sequences用于计算第30步的norm stats"""
+    print(f"Loading dataset from {data_path}...")
+    print(f"Action horizon: {action_horizon}")
+
+    # 获取所有parquet文件
+    parquet_files = []
+    for root, _, files in os.walk(data_path):
+        for file in files:
+            if file.endswith('.parquet'):
+                parquet_files.append(os.path.join(root, file))
+
+    print(f"Found {len(parquet_files)} parquet files")
+
+    all_states = []
+    all_action_sequences = []
+
+    for file_path in tqdm.tqdm(parquet_files, desc="Loading parquet files"):
+        try:
+            df = pd.read_parquet(file_path)
+
+            # 为每个有效的起始点构造action sequence
+            for start_idx in range(len(df) - action_horizon):
+                # 当前状态
+                state = np.array(df.iloc[start_idx]['observation.state'])[:14]
+
+                # 构造action sequence（第1步到第action_horizon步）
+                action_sequence = []
+                for step in range(action_horizon):
+                    target_idx = start_idx + 1 + step
+                    if target_idx < len(df):
+                        action = np.array(df.iloc[target_idx]['action'])[:14]
+                    else:
+                        action = np.array(df.iloc[-1]['action'])[:14]  # 边界处理
+                    action_sequence.append(action)
+
+                all_states.append(state)
+                all_action_sequences.append(action_sequence)
+
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            continue
+
+    # 转换为numpy数组
+    states = np.array(all_states)  # [N, 14]
+    action_sequences = np.array(all_action_sequences)  # [N, action_horizon, 14]
+
+    print(f"Loaded {len(states)} samples")
+    print(f"State shape: {states.shape}")
+    print(f"Action sequences shape: {action_sequences.shape}")
+
+    return states, action_sequences
+
 def load_dataset(data_path: str):
     """加载数据集"""
     print(f"Loading dataset from {data_path}...")
@@ -57,8 +110,36 @@ def load_dataset(data_path: str):
 
     return states, actions
 
+def apply_delta_actions_step30(states, action_sequences, joint_mask, step=29):
+    """应用delta actions转换，使用第30步（step=29）的action计算delta
+
+    这样计算的norm stats能覆盖最大的delta范围，适用于所有时间步
+    """
+    print(f"应用delta actions转换，使用第{step+1}步的action")
+    print(f"joint_mask: {joint_mask[:14]}")
+    print("⚠️  注意：使用第30步的delta范围计算norm stats")
+
+    # 提取第30步的actions
+    actions_step30 = action_sequences[:, step, :]  # [N, 14]
+
+    delta_actions = actions_step30.copy()
+    # 只使用前14维的mask（匹配实际数据维度）
+    mask_14d = np.array(joint_mask[:14])  # 只取前14维
+
+    print(f"实际数据维度: {actions_step30.shape[1]}")
+    print(f"使用的mask维度: {len(mask_14d)}")
+
+    # 对每个样本应用delta转换：action[step] - current_state
+    for i in range(len(actions_step30)):
+        state = states[i]  # [14]
+        action = actions_step30[i]  # [14]
+        # 只对mask为True的维度应用delta转换
+        delta_actions[i] = np.where(mask_14d, action - state, action)
+
+    return delta_actions
+
 def apply_delta_actions(states, actions, joint_mask):
-    """应用delta actions转换，使用OpenPI的DeltaActions transform
+    """应用delta actions转换，使用OpenPI的DeltaActions transform（原始版本）
 
     OpenPI的DeltaActions计算公式：delta_action = action - current_state
     这表示从当前状态到目标动作的偏移量，而不是时间序列差分
@@ -163,6 +244,77 @@ def save_norm_stats(norm_stats, base_dir, dataset_name):
     print(f"  - {output_dir}/norm_stats.json")
 
 
+def compute_norm_stats_step30(data_path, dataset_name, action_horizon=30):
+    """使用第30步的delta计算norm stats"""
+    print(f"🎯 使用第{action_horizon}步的delta范围计算norm stats")
+
+    # 定义关节mask（与lora_train_config.py中保持一致）
+    joint_mask = [True] * 6 + [False] + [True] * 6 + [False] + [False] * 18
+
+    try:
+        # 加载带有action sequences的数据
+        print(f"Loading dataset with action sequences from {data_path}...")
+        states, action_sequences = load_dataset_with_sequences(data_path, action_horizon)
+
+        # 使用第30步的delta计算统计信息
+        print(f"\nComputing normalization statistics using step {action_horizon} delta...")
+
+        # 填充states到32维
+        padded_states = np.zeros((states.shape[0], 32), dtype=states.dtype)
+        padded_states[:, :states.shape[1]] = states
+
+        # 应用第30步的delta转换
+        delta_actions_step30 = apply_delta_actions_step30(states, action_sequences, joint_mask, step=action_horizon-1)
+
+        # 填充到32维
+        padded_actions = np.zeros((delta_actions_step30.shape[0], 32), dtype=delta_actions_step30.dtype)
+        padded_actions[:, :delta_actions_step30.shape[1]] = delta_actions_step30
+
+        # 使用OpenPI官方的RunningStats类
+        keys = ["state", "actions"]
+        stats = {key: normalize.RunningStats() for key in keys}
+
+        print("Computing normalization statistics using step 30 delta...")
+
+        # 分批处理以避免内存问题
+        batch_size = 1000
+        num_batches = (len(padded_states) + batch_size - 1) // batch_size
+
+        for i in tqdm.tqdm(range(num_batches), desc="Computing stats"):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, len(padded_states))
+
+            batch_states = padded_states[start_idx:end_idx]
+            batch_actions = padded_actions[start_idx:end_idx]
+
+            # 更新统计信息 - 使用官方方法
+            stats["state"].update(batch_states)
+            stats["actions"].update(batch_actions)
+
+        # 获取最终统计信息 - 使用官方方法
+        norm_stats = {key: stats_obj.get_statistics() for key, stats_obj in stats.items()}
+
+        # 打印摘要
+        print_stats_summary(norm_stats)
+
+        # 保存统计信息
+        suffix = f"_del_step{action_horizon}"
+        save_norm_stats(norm_stats, "./assets", f"{dataset_name}{suffix}")
+
+        print(f"\n✅ Step {action_horizon} norm stats computation completed successfully!")
+        print(f"Mode: Delta actions using step {action_horizon} range")
+
+        print(f"\n🎉 Step {action_horizon} norm stats计算完成！")
+        print("现在可以使用新的norm stats进行训练了")
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def main(data_path=None, dataset_name=None, use_delta_actions=True):
     """主函数"""
     # 如果没有提供参数，使用默认配置
@@ -212,4 +364,16 @@ def main(data_path=None, dataset_name=None, use_delta_actions=True):
     return True
 
 if __name__ == "__main__":
-    main()
+    # 测试第30步的norm stats计算
+    data_path = "/home/testuser/data/pick_and_place_eggplant/openpi"
+    dataset_name = "pick_and_place_eggplant"
+
+    print("🎯 计算第30步的norm stats...")
+    success = compute_norm_stats_step30(data_path, dataset_name, action_horizon=30)
+
+    if success:
+        print("\n✅ 第30步norm stats计算完成！")
+        print("文件保存为: assets/pick_and_place_eggplant_del_step30/norm_stats.json")
+        print("\n下一步：修改训练配置使用新的norm stats")
+    else:
+        print("\n❌ 计算失败，请检查错误信息")

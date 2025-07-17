@@ -40,9 +40,14 @@ class CustomDataConfig(_config.DataConfigFactory):
             print(f"📝 使用提示: {self.default_prompt}")
             print("🎯 启用真实数据训练！")
 
-            # 加载数据集的norm stats（根据delta模式选择对应的stats）
+            # 加载数据集的norm stats（使用第30步的delta范围）
             norm_stats = None
-            suffix = "_del" if self.use_delta_joint_actions else "_abs"
+            if self.use_delta_joint_actions:
+                # 使用第30步的norm stats，覆盖最大delta范围
+                suffix = "_del_step30"
+                print("🎯 使用第30步的norm stats，适用于action_horizon=30的训练")
+            else:
+                suffix = "_abs"
             norm_stats_path = Path(f"assets/{self.dataset_name}{suffix}")
 
             try:

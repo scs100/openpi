@@ -240,7 +240,7 @@ class FixedDataset:
         
         # 验证数据质量
         if idx % 1000 == 0:
-            print(f"🎯 样本 {idx}: episode={episode_id}, timestep={timestep}")
+            print(f"\n 🎯 获取样本 {idx}: episode={episode_id}, timestep={timestep}")
             print(f"   动作序列形状: {actions_sequence.shape}")
             print(f"   动作范围: [{actions_sequence.min():.3f}, {actions_sequence.max():.3f}]")
             print(f"   状态范围: [{state_32d.min():.3f}, {state_32d.max():.3f}]")

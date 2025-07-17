@@ -639,10 +639,10 @@ def main():
     """
 conda activate openpi && python inference_piper/inference_with_dis_openloop.py \
   --host localhost --port 8000 \
-  --data_path /home/testuser/data/simple/openpi \
-  --episode 10 --step_limit 400 --output inference_result/simple_3w_pred29.png \
-  --future_steps 50 --prediction_step 29    \
-  --multi_step_plot  --max_timesteps 400 --prediction_horizon 50
+  --data_path /home/testuser/data/pass_drink/openpi \
+  --episode 10 --step_limit 2000 --output inference_result/pass_drink_delta_5w_pred29.png \
+  --future_steps 30 --prediction_step 29    \
+  --multi_step_plot  --max_timesteps 2000 --prediction_horizon 30
       """
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="OpenPI完整剧集推理可视化（带扰动）")

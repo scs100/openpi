@@ -54,7 +54,7 @@ def parse_args():
 
 # 解析命令行参数
 args = parse_args()
-
+#训练技巧，先训练1~2w，loss 震荡之后，  然后resume 
 # 配置常量定义
 # 数据配置
 DATASET_PATH = "/home/testuser/data/pass_drink/openpi"  # 修改为您的数据集路径
@@ -64,7 +64,7 @@ USE_DELTA_ACTIONS = True  # 使用相对关节角模式
 # 训练帧率配置 - 已废弃，现在使用数据集原始时间序列
 # TRAINING_FPS = 33.3  # ⚠️ 此参数已不再使用，帧率在数据预处理时确定
 # 实验配置
-EXPERIMENT_NAME = "ae_lora_adamw_delta_actions_15w"  # 只训练action expert LoRA，使用相对关节角
+EXPERIMENT_NAME = "ae_lora_adamw_delta_actions_norm30_bat20_15w"  # 只训练action expert LoRA，使用相对关节角
 WANDB_PROJECT = "lora_ae_drink_delta"  # 修改为您的WandB项目名
 # WandB配置
 FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
@@ -75,13 +75,13 @@ OVERWRITE_CHECKPOINT = args.overwrite   # 从命令行参数获取
 # 优化器选择配置
 USE_ADAMW = True           # True: 使用AdamW, False: 使用SGD
 
-# 批量大小配置 - 根据优化器动态调整
-SGD_BATCH_SIZE = 12           # SGD批量大小 (优化后：更快的训练速度，更好的收敛)
-ADAMW_BATCH_SIZE = 20       # AdamW批量大小 (最佳效率点：16GB显存，2.0s/it)
+# 批量大小配置 - 根据优化器动态调整 (降低以获得更合理的loss)
+SGD_BATCH_SIZE = 6            # SGD批量大小 (降低batch size改善loss收敛)
+ADAMW_BATCH_SIZE = 30          # AdamW批量大小 (从20降到4，改善loss收敛)
 BATCH_SIZE = ADAMW_BATCH_SIZE if USE_ADAMW else SGD_BATCH_SIZE
 
 NUM_WORKERS = 0            # 预加载使用单进程即可
-SAVE_INTERVAL = 2500       # 保存间隔 (每1000步保存，大幅减少内存压力)
+SAVE_INTERVAL = 1000       # 保存间隔 (每1000步保存，大幅减少内存压力)
 NUM_TRAIN_STEPS = 150000     # 训练步数 (增加到20k，持续训练)
 LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
 KEEP_PERIOD = 5000          # 检查点保留周期 (每1000步的检查点永久保留)
@@ -119,7 +119,7 @@ ACTION_EXPERT_VARIANT = "gemma_300m_lora"  # 只有这个使用LoRA训练
 
 # 内存管理配置 - 根据优化器动态调整
 SGD_GPU_MEM_FRACTION = '0.70'    # SGD GPU内存分配比例
-ADAMW_GPU_MEM_FRACTION = '0.65'  # AdamW GPU内存分配比例 (更保守)
+ADAMW_GPU_MEM_FRACTION = '0.85'  # AdamW GPU内存分配比例 (更保守)
 GPU_MEM_FRACTION = ADAMW_GPU_MEM_FRACTION if USE_ADAMW else SGD_GPU_MEM_FRACTION
 # 分阶段Swap管理阈值 - 优化版
 SWAP_WARNING_THRESHOLD = 30    # 警告阈值 - 开始轻度清理
@@ -137,7 +137,7 @@ WARMUP_STEPS = int(NUM_TRAIN_STEPS * WARMUP_RATIO) if not RESUME_TRAINING else 5
 
 # 恢复训练专用内存配置
 RESUME_GPU_MEM_FRACTION = GPU_MEM_FRACTION  # 恢复训练时使用与当前优化器匹配的内存配置
-RESUME_BATCH_SIZE = BATCH_SIZE    # 恢复训练时使用已验证的批量大小
+RESUME_BATCH_SIZE = BATCH_SIZE    # 恢复训练时使用调整后的批量大小
 DYNAMIC_BATCH_ADJUSTMENT = False  # 已找到最优批量大小，禁用动态调整
 MIN_BATCH_SIZE = 1                # 最小批量大小
 
@@ -153,7 +153,6 @@ TARGET_GPU_UTILIZATION = 73          # 目标GPU显存使用率 (73%)
 SAFE_GPU_UTILIZATION = 78            # 安全上限GPU显存使用率 (78%)
 BATCH_ADJUSTMENT_INTERVAL = 100       # 每100步检查一次是否可以调整批量大小
 MIN_STABLE_STEPS = 50                 # 批量大小稳定运行50步后才考虑增加
-MAX_BATCH_SIZE = 10                   # 最大批量大小限制
 
 # 主动Swap管理配置
 class SwapManager:
@@ -696,8 +695,8 @@ def optimize_system_memory():
         print("🔧 恢复训练模式：使用XLA编译（20线程）")
     else:
         # 首次训练使用更多线程充分利用32核CPU
-        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=28'
-        print("🚀 首次训练模式：使用加速XLA编译（28线程，充分利用32核CPU）")
+        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=20'
+        print("🚀 首次训练模式：使用加速XLA编译（20线程，充分利用32核CPU）")
 
     # 系统内存优化
     os.environ['MALLOC_TRIM_THRESHOLD_'] = '0'
@@ -1335,11 +1334,11 @@ if __name__ == "__main__":
         compute_norm_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(compute_norm_module)
 
-        # 调用归一化统计计算
-        success = compute_norm_module.main(
+        # 调用第30步的归一化统计计算
+        success = compute_norm_module.compute_norm_stats_step30(
             data_path=DATASET_PATH,
             dataset_name=DATASET_NAME,
-            use_delta_actions=USE_DELTA_ACTIONS  # 传递delta actions配置
+            action_horizon=ACTION_HORIZON  # 使用第{ACTION_HORIZON}步的delta计算
         )
 
         if success:

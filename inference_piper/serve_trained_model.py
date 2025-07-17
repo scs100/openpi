@@ -53,9 +53,9 @@ def create_trained_model_config(config_name: str, dataset_name: str, data_path: 
         # 模型配置 - 与训练时保持一致
         model=pi0.Pi0Config(
             action_dim=32,          # 必须保持32，与预训练模型匹配
-            action_horizon=50,
+            action_horizon=30,
             max_token_len=48,
-            paligemma_variant="gemma_2b_lora",
+            paligemma_variant="gemma_2b",
             action_expert_variant="gemma_300m_lora"
         ),
 
@@ -63,7 +63,8 @@ def create_trained_model_config(config_name: str, dataset_name: str, data_path: 
         data=CustomDataConfig(
             data_path=data_path,
             default_prompt=default_prompt,
-            dataset_name=dataset_name
+            dataset_name=f"{dataset_name}_del_step30",  # 修复：使用与训练时一致的norm stats路径
+            use_delta_joint_actions=True  # 显式启用delta actions，与训练时保持一致
         ),
 
         # 权重加载器
@@ -100,11 +101,11 @@ def create_policy(model_config: TrainedModelConfig):
 # 所有主要参数都是必需的
 conda activate openpi;
 python inference_piper/serve_trained_model.py \
-     --checkpoint_dir checkpoints/lora_training/lora_sgd_bat6_10w_lr1e-41e5/30000 \
+     --checkpoint_dir   checkpoints/lora_training/ae_lora_adamw_delta_actions_15w/50000 \
      --config_name lora_training \
-     --default_prompt "pick the long eggplant and place on the plant" \
-     --dataset_name "pick_and_place_eggplant_simle" \
-     --data_path "/home/testuser/data/simple/openpi" \
+     --default_prompt "pass me the drink" \
+     --dataset_name "pass_drink" \
+     --data_path "/home/testuser/data/pass_drink/openpi" \
      --port 8000 \
      --host 0.0.0.0
 
@@ -126,7 +127,7 @@ def main():
                         help="默认提示词 (必需)")
     parser.add_argument("--dataset_name",
                         required=True,
-                        help="数据集名称，用于加载norm stats (必需)")
+                        help="数据集基础名称 (如 'pass_drink')，程序会自动添加 '_del_step30' 后缀来匹配训练时的norm stats路径 (必需)")
     parser.add_argument("--data_path",
                         required=True,
                         help="数据集路径 (必需)")
