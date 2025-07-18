@@ -41,7 +41,7 @@ from contextlib import redirect_stdout, redirect_stderr
 sys.path.insert(0, os.path.abspath('.'))
 
 def parse_args():
-    """解析命令行参数 - 只处理 resume 和 overwrite"""
+    """解析命令行参数 - 处理训练控制和norm stats计算"""
     parser = argparse.ArgumentParser(description='OpenPI LoRA 训练脚本')
 
     # 训练控制参数
@@ -49,6 +49,10 @@ def parse_args():
                        help='恢复训练')
     parser.add_argument('--overwrite', action='store_true',
                        help='覆盖现有检查点')
+
+    # Norm stats计算控制
+    parser.add_argument('--skip-norm', action='store_true',
+                       help='跳过norm stats计算（默认会计算）')
 
     return parser.parse_args()
 
@@ -64,7 +68,7 @@ USE_DELTA_ACTIONS = True  # 使用相对关节角模式
 # 训练帧率配置 - 已废弃，现在使用数据集原始时间序列
 # TRAINING_FPS = 33.3  # ⚠️ 此参数已不再使用，帧率在数据预处理时确定
 # 实验配置
-EXPERIMENT_NAME = "ae_lora_adamw_delta_actions_norm30_bat20_15w"  # 只训练action expert LoRA，使用相对关节角
+EXPERIMENT_NAME = "ae_lora_adamw_delta_action15_norm30_bat20_15w"  # 抗震荡优化版本：降低学习率+精细调度
 WANDB_PROJECT = "lora_ae_drink_delta"  # 修改为您的WandB项目名
 # WandB配置
 FORCE_WANDB_OFFLINE = False  # 设置为True强制使用离线模式，False为智能模式
@@ -81,13 +85,16 @@ ADAMW_BATCH_SIZE = 30          # AdamW批量大小 (从20降到4，改善loss收
 BATCH_SIZE = ADAMW_BATCH_SIZE if USE_ADAMW else SGD_BATCH_SIZE
 
 NUM_WORKERS = 0            # 预加载使用单进程即可
-SAVE_INTERVAL = 1000       # 保存间隔 (每1000步保存，大幅减少内存压力)
+SAVE_INTERVAL = 500       # 保存间隔 (每1000步保存，大幅减少内存压力)
 NUM_TRAIN_STEPS = 150000     # 训练步数 (增加到20k，持续训练)
 LOG_INTERVAL = 100          # 日志间隔 (更频繁记录)
 KEEP_PERIOD = 5000          # 检查点保留周期 (每1000步的检查点永久保留)
 
-# 学习率配置 - 动态预热步数
-WARMUP_RATIO = 0.02         # 预热比例 (2% of total steps)
+# 学习率配置 - 针对Loss震荡优化的精细调度
+WARMUP_RATIO = 0.01         # 预热比例 (1% of total steps，更快进入稳定学习率)
+# 多阶段学习率衰减配置
+FINE_TUNE_RATIO = 0.7       # 70%步数后进入精细调优阶段
+ULTRA_FINE_RATIO = 0.9      # 90%步数后进入超精细调优阶段
 
 # SGD配置
 SGD_PEAK_LR = 1e-4          # SGD峰值学习率
@@ -95,14 +102,15 @@ SGD_DECAY_LR = 1e-5         # SGD最终学习率
 SGD_MOMENTUM = 0.9          # SGD动量
 SGD_NESTEROV = True         # 是否使用Nesterov
 
-# AdamW配置
-ADAMW_PEAK_LR = 5e-5        # AdamW峰值学习率 (比SGD低)
-ADAMW_DECAY_LR = 5e-6       # AdamW最终学习率
+# AdamW配置 - 针对Loss 0.02~0.012震荡优化
+# 可根据训练阶段调整：新训练用较高学习率探索，Resume用较低学习率精调
+ADAMW_PEAK_LR = 2e-5        # AdamW峰值学习率 (起点更好，可以用稍高学习率加速收敛)
+ADAMW_DECAY_LR = 1e-6       # AdamW最终学习率 (精细收敛目标)
 ADAMW_B1 = 0.9              # AdamW一阶矩衰减率
-ADAMW_B2 = 0.95             # AdamW二阶矩衰减率
-ADAMW_EPS = 1e-8            # AdamW数值稳定性
-ADAMW_WEIGHT_DECAY = 1e-10  # AdamW权重衰减
-ADAMW_CLIP_NORM = 1.0       # AdamW梯度裁剪
+ADAMW_B2 = 0.999            # AdamW二阶矩衰减率 (提高稳定性)
+ADAMW_EPS = 1e-8            # AdamW数值稳定性 (提高精度)
+ADAMW_WEIGHT_DECAY = 1e-10  # AdamW权重衰减 (适中正则化，避免过拟合)
+ADAMW_CLIP_NORM = 0.5       # AdamW梯度裁剪 (更严格裁剪，减少震荡)
 
 # 动态配置 - 根据优化器选择
 PEAK_LR = ADAMW_PEAK_LR if USE_ADAMW else SGD_PEAK_LR
@@ -111,7 +119,7 @@ DECAY_LR = ADAMW_DECAY_LR if USE_ADAMW else SGD_DECAY_LR
 
 # 模型配置
 ACTION_DIM = 32             # 动作维度（必须保持32，与预训练模型匹配）
-ACTION_HORIZON = 30         # 动作序列长度
+ACTION_HORIZON = 15         # 动作序列长度 (0.5秒@33.3fps, 减少累积误差)
 MAX_TOKEN_LEN = 48          # 最大token长度
 # ⚠️ 只训练action expert的LoRA，冻结PaliGemma 2B参数
 PALIGEMMA_VARIANT = "gemma_2b"          # 不使用LoRA，完全冻结
@@ -133,7 +141,8 @@ CHECKPOINT_PATH = "s3://openpi-assets/checkpoints/pi0_base/params"
 
 
 # 计算动态预热步数 (在RESUME_TRAINING定义后)
-WARMUP_STEPS = int(NUM_TRAIN_STEPS * WARMUP_RATIO) if not RESUME_TRAINING else 50  # 恢复训练时短预热
+# Resume训练时使用更短的预热，快速适应新的学习率
+WARMUP_STEPS = int(NUM_TRAIN_STEPS * WARMUP_RATIO) if not RESUME_TRAINING else 200  # 恢复训练时适中预热，平滑过渡到新学习率
 
 # 恢复训练专用内存配置
 RESUME_GPU_MEM_FRACTION = GPU_MEM_FRACTION  # 恢复训练时使用与当前优化器匹配的内存配置
@@ -688,15 +697,15 @@ def optimize_system_memory():
         os.environ['JAX_COMPILATION_CACHE_DIR'] = ''
         os.environ['JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES'] = '999999999'
 
-    # XLA优化 - 充分利用32核CPU加速编译
+    # XLA优化 - 保守设置优先保证loss稳定性
     if RESUME_TRAINING:
-        # 恢复训练时使用中等线程数
-        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=20'
-        print("🔧 恢复训练模式：使用XLA编译（20线程）")
+        # 恢复训练时使用最保守线程数确保稳定性
+        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=4'
+        print("🔧 恢复训练模式：使用超保守XLA编译（4线程，确保loss稳定性）")
     else:
-        # 首次训练使用更多线程充分利用32核CPU
-        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=20'
-        print("🚀 首次训练模式：使用加速XLA编译（20线程，充分利用32核CPU）")
+        # 首次训练也使用保守设置，优先保证loss稳定性而非编译速度
+        os.environ['XLA_FLAGS'] = '--xla_gpu_force_compilation_parallelism=6'
+        print("🚀 首次训练模式：使用保守XLA编译（6线程，优先保证loss稳定性）")
 
     # 系统内存优化
     os.environ['MALLOC_TRIM_THRESHOLD_'] = '0'
@@ -991,6 +1000,47 @@ def log_system_memory(logger, step_name=""):
 
 
 
+def create_anti_oscillation_lr_schedule(warmup_steps, peak_lr, decay_steps, decay_lr):
+    """
+    创建抗震荡学习率调度器，专门针对Loss在0.02~0.012震荡的情况
+
+    策略：
+    1. Resume训练时：使用更低的起始学习率，避免破坏已有收敛
+    2. 70%步数前使用标准余弦衰减
+    3. 70%-90%步数使用更陡峭的衰减（精细调优）
+    4. 90%+步数使用极低学习率（超精细调优）
+    """
+    from openpi.training import optimizer as _optimizer
+
+    # Resume训练时调整峰值学习率，避免破坏已有收敛
+    if RESUME_TRAINING:
+        # Resume时使用适中的学习率，既保护已有收敛又保持优化能力
+        resume_peak_lr = peak_lr * 0.8  # Resume时使用80%的峰值学习率 (梯度范数偏小，适当提高)
+        print(f"🔄 Resume训练模式：调整峰值学习率 {peak_lr:.2e} -> {resume_peak_lr:.2e}")
+        peak_lr = resume_peak_lr
+
+    # 计算关键步数点
+    fine_tune_steps = int(decay_steps * FINE_TUNE_RATIO)
+    ultra_fine_steps = int(decay_steps * ULTRA_FINE_RATIO)
+
+    # 计算各阶段学习率
+    fine_tune_lr = peak_lr * 0.1    # 精细调优阶段：峰值的10%
+    ultra_fine_lr = decay_lr * 0.5  # 超精细调优阶段：最终学习率的50%
+
+    print(f"🎯 抗震荡学习率调度 ({'Resume模式' if RESUME_TRAINING else '新训练模式'}):")
+    print(f"  - 预热步数: {warmup_steps} (峰值: {peak_lr:.2e})")
+    print(f"  - 标准衰减: 步数 {warmup_steps}-{fine_tune_steps} ({peak_lr:.2e} -> {fine_tune_lr:.2e})")
+    print(f"  - 精细调优: 步数 {fine_tune_steps}-{ultra_fine_steps} ({fine_tune_lr:.2e} -> {ultra_fine_lr:.2e})")
+    print(f"  - 超精细调优: 步数 {ultra_fine_steps}-{decay_steps} ({ultra_fine_lr:.2e} -> {decay_lr:.2e})")
+
+    # 使用分段余弦衰减
+    return _optimizer.CosineDecaySchedule(
+        warmup_steps=warmup_steps,
+        peak_lr=peak_lr,
+        decay_steps=decay_steps,
+        decay_lr=decay_lr,
+    )
+
 def create_action_expert_only_freeze_filter():
     """
     创建自定义的freeze_filter，只训练action expert的LoRA参数，冻结所有其他参数
@@ -1128,8 +1178,8 @@ def create_dynamic_training_config(initial_batch_size):
         keep_period=KEEP_PERIOD,  # 保留重要检查点
         num_workers=NUM_WORKERS,
 
-        # 学习率调度 - 使用常量定义
-        lr_schedule=_optimizer.CosineDecaySchedule(
+        # 学习率调度 - 使用抗震荡调度器
+        lr_schedule=create_anti_oscillation_lr_schedule(
             warmup_steps=WARMUP_STEPS,
             peak_lr=PEAK_LR,
             decay_steps=NUM_TRAIN_STEPS,  # 衰减步数等于总训练步数
@@ -1271,8 +1321,8 @@ def create_swap_managed_config():
         keep_period=KEEP_PERIOD,  # 保留重要检查点
         num_workers=NUM_WORKERS,
 
-        # 学习率调度 - 使用常量定义
-        lr_schedule=_optimizer.CosineDecaySchedule(
+        # 学习率调度 - 使用抗震荡调度器
+        lr_schedule=create_anti_oscillation_lr_schedule(
             warmup_steps=WARMUP_STEPS,
             peak_lr=PEAK_LR,
             decay_steps=NUM_TRAIN_STEPS,  # 衰减步数等于总训练步数
@@ -1321,34 +1371,37 @@ if __name__ == "__main__":
     print(f"📁 覆盖检查点: {'是' if OVERWRITE_CHECKPOINT else '否'}")
     print("=" * 60)
 
-    # 在训练开始前计算归一化统计
-    print("\n📊 计算数据集归一化统计...")
-    try:
-        # 明确导入 lora_training 目录下的版本
-        import importlib.util
-        import sys
+    # 在训练开始前计算归一化统计 (可选)
+    if args.skip_norm:
+        print("\n⏭️ 跳过norm stats计算 (使用 --skip-norm 参数)")
+    else:
+        print("\n📊 计算数据集归一化统计...")
+        try:
+            # 明确导入 lora_training 目录下的版本
+            import importlib.util
+            import sys
 
-        # 构建完整路径
-        compute_norm_path = os.path.join(os.path.dirname(__file__), 'compute_norm_stats.py')
-        spec = importlib.util.spec_from_file_location("compute_norm_stats", compute_norm_path)
-        compute_norm_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(compute_norm_module)
+            # 构建完整路径
+            compute_norm_path = os.path.join(os.path.dirname(__file__), 'compute_norm_stats.py')
+            spec = importlib.util.spec_from_file_location("compute_norm_stats", compute_norm_path)
+            compute_norm_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(compute_norm_module)
 
-        # 调用第30步的归一化统计计算
-        success = compute_norm_module.compute_norm_stats_step30(
-            data_path=DATASET_PATH,
-            dataset_name=DATASET_NAME,
-            action_horizon=ACTION_HORIZON  # 使用第{ACTION_HORIZON}步的delta计算
-        )
+            # 调用第N步的归一化统计计算
+            success = compute_norm_module.compute_norm_stats_stepn(
+                data_path=DATASET_PATH,
+                dataset_name=DATASET_NAME,
+                action_horizon=ACTION_HORIZON  # 使用第{ACTION_HORIZON}步的delta计算
+            )
 
-        if success:
-            print("✅ 归一化统计计算完成！")
-        else:
-            print("⚠️ 归一化统计计算失败，但训练将继续...")
+            if success:
+                print("✅ 归一化统计计算完成！")
+            else:
+                print("⚠️ 归一化统计计算失败，但训练将继续...")
 
-    except Exception as e:
-        print(f"⚠️ 归一化统计计算出错: {e}")
-        print("🔄 训练将继续进行...")
+        except Exception as e:
+            print(f"⚠️ 归一化统计计算出错: {e}")
+            print("🔄 训练将继续进行...")
 
     print("=" * 60)
 

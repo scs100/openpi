@@ -16,8 +16,18 @@ sys.path.insert(0, '/home/testuser/code/opensource/openpi/src')
 
 import openpi.shared.normalize as normalize
 
-def load_dataset_with_sequences(data_path, action_horizon=30):
-    """加载数据集，构造action sequences用于计算第30步的norm stats"""
+# 导入ACTION_HORIZON配置
+try:
+    from start_lora_training import ACTION_HORIZON
+    print(f"✅ 使用配置的ACTION_HORIZON: {ACTION_HORIZON}")
+except ImportError:
+    ACTION_HORIZON = 15  # 默认值
+    print(f"⚠️ 无法导入ACTION_HORIZON，使用默认值: {ACTION_HORIZON}")
+
+def load_dataset_with_sequences(data_path, action_horizon=None):
+    """加载数据集，构造action sequences用于计算第N步的norm stats"""
+    if action_horizon is None:
+        action_horizon = ACTION_HORIZON
     print(f"Loading dataset from {data_path}...")
     print(f"Action horizon: {action_horizon}")
 
@@ -110,29 +120,31 @@ def load_dataset(data_path: str):
 
     return states, actions
 
-def apply_delta_actions_step30(states, action_sequences, joint_mask, step=29):
-    """应用delta actions转换，使用第30步（step=29）的action计算delta
+def apply_delta_actions_stepn(states, action_sequences, joint_mask, step=None):
+    """应用delta actions转换，使用第N步的action计算delta
 
     这样计算的norm stats能覆盖最大的delta范围，适用于所有时间步
     """
+    if step is None:
+        step = ACTION_HORIZON - 1  # 使用最后一步
     print(f"应用delta actions转换，使用第{step+1}步的action")
     print(f"joint_mask: {joint_mask[:14]}")
-    print("⚠️  注意：使用第30步的delta范围计算norm stats")
+    print(f"⚠️  注意：使用第{step+1}步的delta范围计算norm stats")
 
-    # 提取第30步的actions
-    actions_step30 = action_sequences[:, step, :]  # [N, 14]
+    # 提取第N步的actions
+    actions_stepn = action_sequences[:, step, :]  # [N, 14]
 
-    delta_actions = actions_step30.copy()
+    delta_actions = actions_stepn.copy()
     # 只使用前14维的mask（匹配实际数据维度）
     mask_14d = np.array(joint_mask[:14])  # 只取前14维
 
-    print(f"实际数据维度: {actions_step30.shape[1]}")
+    print(f"实际数据维度: {actions_stepn.shape[1]}")
     print(f"使用的mask维度: {len(mask_14d)}")
 
     # 对每个样本应用delta转换：action[step] - current_state
-    for i in range(len(actions_step30)):
+    for i in range(len(actions_stepn)):
         state = states[i]  # [14]
-        action = actions_step30[i]  # [14]
+        action = actions_stepn[i]  # [14]
         # 只对mask为True的维度应用delta转换
         delta_actions[i] = np.where(mask_14d, action - state, action)
 
@@ -244,8 +256,8 @@ def save_norm_stats(norm_stats, base_dir, dataset_name):
     print(f"  - {output_dir}/norm_stats.json")
 
 
-def compute_norm_stats_step30(data_path, dataset_name, action_horizon=30):
-    """使用第30步的delta计算norm stats"""
+def compute_norm_stats_stepn(data_path, dataset_name, action_horizon):
+    """使用第N步的delta计算norm stats"""
     print(f"🎯 使用第{action_horizon}步的delta范围计算norm stats")
 
     # 定义关节mask（与lora_train_config.py中保持一致）
@@ -263,18 +275,18 @@ def compute_norm_stats_step30(data_path, dataset_name, action_horizon=30):
         padded_states = np.zeros((states.shape[0], 32), dtype=states.dtype)
         padded_states[:, :states.shape[1]] = states
 
-        # 应用第30步的delta转换
-        delta_actions_step30 = apply_delta_actions_step30(states, action_sequences, joint_mask, step=action_horizon-1)
+        # 应用第N步的delta转换
+        delta_actions_stepn = apply_delta_actions_stepn(states, action_sequences, joint_mask, step=action_horizon-1)
 
         # 填充到32维
-        padded_actions = np.zeros((delta_actions_step30.shape[0], 32), dtype=delta_actions_step30.dtype)
-        padded_actions[:, :delta_actions_step30.shape[1]] = delta_actions_step30
+        padded_actions = np.zeros((delta_actions_stepn.shape[0], 32), dtype=delta_actions_stepn.dtype)
+        padded_actions[:, :delta_actions_stepn.shape[1]] = delta_actions_stepn
 
         # 使用OpenPI官方的RunningStats类
         keys = ["state", "actions"]
         stats = {key: normalize.RunningStats() for key in keys}
 
-        print("Computing normalization statistics using step 30 delta...")
+        print(f"Computing normalization statistics using step {action_horizon} delta...")
 
         # 分批处理以避免内存问题
         batch_size = 1000
@@ -364,16 +376,17 @@ def main(data_path=None, dataset_name=None, use_delta_actions=True):
     return True
 
 if __name__ == "__main__":
-    # 测试第30步的norm stats计算
+    # 测试第N步的norm stats计算
     data_path = "/home/testuser/data/pick_and_place_eggplant/openpi"
     dataset_name = "pick_and_place_eggplant"
+    action_horizon = 15  # 可以修改为任意步数
 
-    print("🎯 计算第30步的norm stats...")
-    success = compute_norm_stats_step30(data_path, dataset_name, action_horizon=30)
+    print(f"🎯 计算第{action_horizon}步的norm stats...")
+    success = compute_norm_stats_stepn(data_path, dataset_name, action_horizon)
 
     if success:
-        print("\n✅ 第30步norm stats计算完成！")
-        print("文件保存为: assets/pick_and_place_eggplant_del_step30/norm_stats.json")
+        print(f"\n✅ 第{action_horizon}步norm stats计算完成！")
+        print(f"文件保存为: assets/pick_and_place_eggplant_del_step{action_horizon}/norm_stats.json")
         print("\n下一步：修改训练配置使用新的norm stats")
     else:
         print("\n❌ 计算失败，请检查错误信息")
